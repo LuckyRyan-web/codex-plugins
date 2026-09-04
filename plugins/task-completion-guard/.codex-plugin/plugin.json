@@ -1,0 +1,33 @@
+{
+  "name": "task-completion-guard",
+  "version": "0.1.0",
+  "description": "Keep execution tasks running until Codex submits a structured, evidence-backed completion audit.",
+  "author": {
+    "name": "LuckyRyan-web",
+    "url": "https://github.com/LuckyRyan-web"
+  },
+  "homepage": "https://github.com/LuckyRyan-web/codex-plugins/tree/main/plugins/task-completion-guard",
+  "repository": "https://github.com/LuckyRyan-web/codex-plugins",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "completion",
+    "hooks",
+    "guardrail",
+    "verification"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Task Completion Guard",
+    "shortDescription": "Prevent implementation tasks from ending after a partial step.",
+    "longDescription": "Automatically enrolls implementation tasks in a bounded completion audit, records observable change and verification evidence, and continues Codex when its final completion declaration is incomplete or inconsistent with that evidence.",
+    "developerName": "LuckyRyan-web",
+    "category": "Productivity",
+    "capabilities": ["Automation"],
+    "websiteURL": "https://github.com/LuckyRyan-web/codex-plugins",
+    "defaultPrompt": [
+      "Implement this feature completely and verify the result.",
+      "Fix this bug without stopping at an intermediate step."
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Task Completion Guard"
+  short_description: "Prevent coding tasks from stopping before verification"
+  default_prompt: "Use $task-completion-guard to finish this implementation task completely and verify it."
+policy:
+  allow_implicit_invocation: true

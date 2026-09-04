@@ -1,0 +1,20 @@
+{
+  "name": "luckyryan-codex-plugins",
+  "interface": {
+    "displayName": "LuckyRyan Codex Plugins"
+  },
+  "plugins": [
+    {
+      "name": "task-completion-guard",
+      "source": {
+        "source": "local",
+        "path": "./plugins/task-completion-guard"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

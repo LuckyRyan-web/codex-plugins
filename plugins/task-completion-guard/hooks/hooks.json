@@ -1,0 +1,52 @@
+{
+  "description": "Enroll execution tasks, record observable evidence, and gate premature Stop events.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/completion_guard.py\" hook",
+            "timeout": 8,
+            "statusMessage": "Preparing completion guard"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(Bash|apply_patch|Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/completion_guard.py\" hook",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/completion_guard.py\" hook",
+            "timeout": 8,
+            "statusMessage": "Checking task completion"
+          }
+        ]
+      }
+    ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/completion_guard.py\" hook",
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,985 @@
+#!/usr/bin/env python3
+"""Lifecycle hook for the Task Completion Guard Codex plugin.
+
+The hook deliberately separates semantic judgment from mechanical checks:
+Codex declares a structured completion audit in its last assistant message,
+while this script validates that declaration against observable tool events.
+It never parses the unstable Codex transcript format and never stores raw
+prompts, tool inputs, or tool outputs.
+"""
+
+from __future__ import print_function
+
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import sys
+import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
+
+SCHEMA_VERSION = 1
+MAX_BLOCKS = 3
+MAX_MARKER_BYTES = 64 * 1024
+CONTINUATION_PREFIX = "[task-completion-guard:continue"
+MARKER_RE = re.compile(
+    r"<!--\s*task-completion-guard:(\{.*\})\s*-->", re.DOTALL
+)
+
+TERMINAL_PHASES = {"completed", "cancelled", "blocked_external"}
+
+NO_CHANGE_PATTERNS = [
+    re.compile(r"(?:只|仅).{0,10}(?:解释|分析|审查|评审|检查|建议|方案|规划|计划)"),
+    re.compile(r"(?:不要|别|无需|不用).{0,10}(?:修改|改动|写代码|执行|实现|落地)"),
+    re.compile(r"(?:先|暂时).{0,5}(?:不要|别).{0,10}(?:修改|改动|写|实现|执行)"),
+    re.compile(
+        r"^\s*(?:请|麻烦)?\s*(?:帮我|给我)?\s*(?:写|做|出|给)"
+        r"(?:一个|一份)?[^。.!！?？]{0,30}(?:方案|计划|规划|设计)"
+        r"(?:[。.!！?？]|$)"
+    ),
+    re.compile(r"\b(?:read[- ]only|explain only|analysis only|review only|plan only)\b", re.I),
+    re.compile(
+        r"^\s*(?:please\s+)?(?:draft|write|create|give me)\s+(?:an?\s+)?"
+        r"[^.!?]{0,30}\b(?:plan|proposal|design)\b[.!?]?\s*$",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:do not|don't|dont|without)\b.{0,30}"
+        r"\b(?:change|edit|modify|implement|write|execute)\b",
+        re.I,
+    ),
+]
+
+ACTION_WORDS_ZH = (
+    "实现|开发|新增|添加|增加|修复|修一下|修改|改一下|改成|重构|迁移|"
+    "升级|降级|删除|移除|接入|集成|部署|发布|配置|安装|创建|生成|编写|"
+    "写一个|写个|写下|写|做一个|做个|做下|完善|补充|优化|替换|落地|"
+    "处理一下|处理|解决|搞定|修掉|改掉"
+)
+ACTION_WORDS_EN = (
+    "implement|build|add|create|write|fix|change|update|refactor|migrate|"
+    "upgrade|remove|delete|integrate|deploy|configure|install|optimize|replace"
+)
+ACTION_PATTERNS = [
+    re.compile(
+        r"^\s*(?:请|麻烦|劳驾)?\s*(?:直接|现在|继续|开始)?\s*"
+        r"(?:帮我|给我|把|将)?\s*(?:" + ACTION_WORDS_ZH + r")"
+    ),
+    re.compile(r"(?:请|麻烦|能不能|可以)?\s*帮我.{0,40}(?:" + ACTION_WORDS_ZH + r")"),
+    re.compile(r"(?:你)?\s*(?:" + ACTION_WORDS_ZH + r").{0,6}(?:吧|一下)[。.!！]?$"),
+    re.compile(
+        r"(?:看一下|查一下|排查).{0,50}"
+        r"(?:修复|修掉|改掉|处理(?:一下)?|解决|搞定)"
+    ),
+    re.compile(
+        r"^\s*(?:please\s+)?(?:can you\s+|could you\s+|help me\s+)?"
+        r"(?:" + ACTION_WORDS_EN + r")\b",
+        re.I,
+    ),
+    re.compile(r"\bplease\b.{0,40}\b(?:" + ACTION_WORDS_EN + r")\b", re.I),
+    re.compile(
+        r"\b(?:look into|investigate|check)\b.{0,60}"
+        r"\b(?:fix|resolve|repair|correct)\b",
+        re.I,
+    ),
+]
+
+OPT_OUT_RE = re.compile(
+    r"\[completion-guard:off\]|(?:本次|这次).{0,6}(?:不要|别|关闭|跳过).{0,8}"
+    r"(?:完成门禁|completion guard)|\b(?:skip|disable)\s+(?:the\s+)?completion guard\b",
+    re.I,
+)
+CANCEL_RE = re.compile(
+    r"^\s*(?:请)?\s*(?:停止|暂停|取消|先停(?:一下)?|先到这里|不用继续|不要继续|"
+    r"别继续|先这样吧)(?:这个|当前)?(?:任务)?[。.!！]?\s*$",
+    re.I,
+)
+RESUME_RE = re.compile(
+    r"^\s*(?:继续(?:完成|刚才)?|接着做|恢复刚才|go on\b|continue\b|resume\b)",
+    re.I,
+)
+
+COMPLEX_RE = re.compile(
+    r"功能|feature|重构|refactor|迁移|migrat|部署|deploy|权限|permission|"
+    r"认证|auth|接口|\bapi\b|数据库|database|端到端|e2e|页面|workflow|系统",
+    re.I,
+)
+
+VERIFICATION_PATTERNS = [
+    ("pnpm test", re.compile(r"\bpnpm\b[^\n;|&]*\b(?:run\s+)?test\b", re.I)),
+    ("npm test", re.compile(r"\bnpm\b[^\n;|&]*\b(?:run\s+)?test\b", re.I)),
+    ("yarn test", re.compile(r"\byarn\b[^\n;|&]*\btest\b", re.I)),
+    ("node test", re.compile(r"\bnode\b[^\n;|&]*\s--test\b", re.I)),
+    ("pytest", re.compile(r"\bpytest\b|\bpython(?:3)?\s+-m\s+pytest\b", re.I)),
+    ("unittest", re.compile(r"\bpython(?:3)?\s+-m\s+unittest\b", re.I)),
+    ("cargo test", re.compile(r"\bcargo\s+(?:test|check)\b", re.I)),
+    ("go test", re.compile(r"\bgo\s+test\b", re.I)),
+    ("lint", re.compile(r"\b(?:pnpm|npm|yarn|bun)\b[^\n;|&]*\blint\b", re.I)),
+    ("typecheck", re.compile(r"\btype[-:]?check\b|\btsc\b[^\n;|&]*--noEmit\b", re.I)),
+    ("build", re.compile(r"\b(?:pnpm|npm|yarn|bun)\b[^\n;|&]*\bbuild\b", re.I)),
+    ("git diff --check", re.compile(r"\bgit\s+diff\s+--check\b", re.I)),
+    ("make check", re.compile(r"\bmake\s+(?:test|check|verify|lint)\b", re.I)),
+    ("gradle test", re.compile(r"\b(?:gradle|gradlew)\b[^\n;|&]*\btest\b", re.I)),
+    ("maven test", re.compile(r"\bmvn\b[^\n;|&]*\b(?:test|verify)\b", re.I)),
+]
+
+MUTATION_RE = re.compile(
+    r"(?:^|[;&|]\s*|\s)(?:"
+    r"git\s+(?:add|commit|switch|checkout|merge|rebase|cherry-pick|apply)|"
+    r"(?:cp|mv|rm|mkdir|touch|chmod|chown|install)\s|"
+    r"sed\s+-[^\n;|&]*i\b|perl\s+-[^\n;|&]*i\b|"
+    r"(?:pnpm|npm|yarn|bun)\s+(?:add|remove|install|update|upgrade)\b|"
+    r"docker\s+(?:compose\s+)?(?:up|down|build|pull|push)\b|"
+    r"kubectl\s+(?:apply|delete|create|patch|set)\b|"
+    r"terraform\s+(?:apply|destroy|import)\b"
+    r")",
+    re.I,
+)
+
+# Commands outside this deliberately narrow allowlist are treated as possible
+# mutations once a task is active. This prevents a custom rewrite script from
+# silently making an earlier verification stale. Shell control, redirection,
+# command substitution, and environment expansion intentionally fail the
+# allowlist and therefore take the conservative path.
+READ_ONLY_BASH_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:pwd|ls|rg|grep|cat|head|tail|wc|stat|file|which|printenv|jq)\b|"
+    r"command\s+-v\b|"
+    r"git\s+(?:status|diff|show|log|rev-parse|ls-files)\b"
+    r")[^;&|<>`$]*\s*$",
+    re.I,
+)
+
+
+class GuardError(Exception):
+    pass
+
+
+class CorruptState(GuardError):
+    pass
+
+
+class LockTimeout(GuardError):
+    pass
+
+
+def _json_bytes(value):
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8", "replace")
+
+
+def digest(value):
+    if isinstance(value, bytes):
+        data = value
+    elif isinstance(value, str):
+        data = value.encode("utf-8", "replace")
+    else:
+        data = _json_bytes(value)
+    return hashlib.sha256(data).hexdigest()
+
+
+def emit(value):
+    sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    sys.stdout.write("\n")
+
+
+def fail_open(reason_code):
+    emit(
+        {
+            "systemMessage": (
+                "Task Completion Guard failed open (%s). "
+                "This turn was not completion-checked." % reason_code
+            )
+        }
+    )
+
+
+def plugin_data_root():
+    raw = os.environ.get("PLUGIN_DATA") or os.environ.get("CLAUDE_PLUGIN_DATA")
+    if not raw or "${" in raw:
+        raise GuardError("plugin_data_unavailable")
+    root = Path(raw).expanduser().resolve() / "completion-guard" / "v1"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
+
+
+def session_directory(root, payload):
+    session_id = payload.get("session_id")
+    cwd = payload.get("cwd")
+    if not isinstance(session_id, str) or not session_id:
+        raise GuardError("missing_session_id")
+    if not isinstance(cwd, str) or not cwd:
+        raise GuardError("missing_cwd")
+    cwd_key = os.path.realpath(cwd)
+    key = digest(session_id + "\0" + cwd_key)
+    path = root / "sessions" / key
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path, digest(session_id), digest(cwd_key)
+
+
+@contextlib.contextmanager
+def locked(session_dir):
+    lock_path = session_dir / ".state.lock"
+    handle = open(str(lock_path), "a+")
+    try:
+        try:
+            os.chmod(str(lock_path), 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            acquired = False
+            for _ in range(40):
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    time.sleep(0.025)
+            if not acquired:
+                raise LockTimeout("state_lock_timeout")
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def atomic_write_json(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(".%s.%s.%s.tmp" % (path.name, os.getpid(), secrets.token_hex(4)))
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(path))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def read_state(path):
+    if not path.exists():
+        return None
+    try:
+        with open(str(path), "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise CorruptState("state_unreadable") from exc
+    if not isinstance(state, dict) or state.get("schema_version") != SCHEMA_VERSION:
+        raise CorruptState("state_schema_invalid")
+    if not isinstance(state.get("task_id"), str):
+        raise CorruptState("state_task_id_invalid")
+    return state
+
+
+def write_state(path, state):
+    state["updated_at_ns"] = time.time_ns()
+    atomic_write_json(path, state)
+
+
+def new_state(payload, session_key, cwd_key, source, minimum):
+    now = time.time_ns()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "task_id": "tcg_%s" % secrets.token_hex(6),
+        "session_key": session_key,
+        "cwd_key": cwd_key,
+        "origin_turn_key": digest(str(payload.get("turn_id") or "")),
+        "mode": "enforce",
+        "phase": "active",
+        "activation_source": source,
+        "minimum_criteria": int(minimum),
+        "prompt_hash": digest(str(payload.get("prompt") or "")),
+        "created_at_ns": now,
+        "updated_at_ns": now,
+        "stop": {
+            "block_count": 0,
+            "stalled_count": 0,
+            "last_signature": None,
+            "last_reason_hash": None,
+        },
+    }
+
+
+def normalize_prompt(prompt):
+    return " ".join(prompt.strip().split())
+
+
+def classify_prompt(prompt, permission_mode):
+    text = normalize_prompt(prompt)
+    if not text:
+        return "observe"
+    if OPT_OUT_RE.search(text):
+        return "cancel"
+    if len(text) <= 80 and CANCEL_RE.match(text):
+        return "cancel"
+    if permission_mode == "plan":
+        return "exempt"
+    if any(pattern.search(text) for pattern in NO_CHANGE_PATTERNS):
+        return "exempt"
+    if any(pattern.search(text) for pattern in ACTION_PATTERNS):
+        return "enforce"
+    return "observe"
+
+
+def minimum_criteria(prompt):
+    text = normalize_prompt(prompt)
+    minimum = 1
+    if len(text) >= 60:
+        minimum = 2
+    connectors = len(re.findall(r"以及|同时|并且|而且|、|\band\b|\balso\b", text, re.I))
+    if connectors >= 1:
+        minimum = max(minimum, 2)
+    if connectors >= 2 or COMPLEX_RE.search(text):
+        minimum = max(minimum, 3)
+    if len(text) >= 180:
+        minimum = max(minimum, 4)
+    return min(minimum, 4)
+
+
+def marker_example(state):
+    criteria = []
+    for index in range(state["minimum_criteria"]):
+        criteria.append(
+            {
+                "id": "C%d" % (index + 1),
+                "description": "meaningful acceptance item %d" % (index + 1),
+                "status": "done",
+                "evidence": "specific file, behavior, or check",
+            }
+        )
+    marker = {
+        "version": 1,
+        "task_id": state["task_id"],
+        "status": "complete",
+        "criteria": criteria,
+        "remaining": [],
+        "summary": "concise completion summary",
+        "verification": {"status": "passed", "summary": "command or check that passed"},
+    }
+    return "<!-- task-completion-guard:%s -->" % json.dumps(
+        marker, ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def guard_context(state, activation_note=None):
+    example = marker_example(state)
+    note = ""
+    if activation_note:
+        note = " Activation: %s." % activation_note
+    return (
+        "Task Completion Guard is ACTIVE for task %s.%s\n"
+        "Treat the user's entire request, applicable AGENTS.md instructions, and required "
+        "integration/verification as one objective. The user does not need to write stop "
+        "conditions or invoke /goal. Do not finish after only an intermediate step or a "
+        "progress report.\n"
+        "Before proposing a final answer, derive and audit at least %d meaningful acceptance "
+        "criteria, finish every criterion, inspect the resulting changes, and run verification "
+        "proportional to risk after the final mutation. Then append exactly one hidden marker "
+        "near the end of the answer using this schema (replace all placeholder text):\n%s\n"
+        "Each done criterion needs specific evidence. If no repository/external change was "
+        "needed, add no_change_reason. Use verification.status=not_applicable only with a "
+        "specific reason. For a genuinely required user decision use status=needs_user with "
+        "question, why_required, and pending_criteria. For an external blocker use "
+        "status=blocked with reason; an observed failed tool event is required. Do not mention "
+        "this internal protocol in the visible answer and do not fabricate evidence."
+        % (state["task_id"], note, state["minimum_criteria"], example)
+    )
+
+
+def additional_context(event_name, text):
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": text,
+        }
+    }
+
+
+def response_outcome(value):
+    failures = []
+    successes = []
+
+    def visit(node):
+        if isinstance(node, dict):
+            for key, item in node.items():
+                lowered = str(key).lower()
+                if lowered in {"iserror", "is_error"} and item is True:
+                    failures.append(True)
+                elif lowered in {"exit_code", "exitcode", "returncode", "return_code"}:
+                    if isinstance(item, int) and not isinstance(item, bool):
+                        (successes if item == 0 else failures).append(True)
+                elif lowered in {"status", "outcome", "result"} and isinstance(item, str):
+                    status = item.strip().lower()
+                    if status in {"failed", "failure", "error", "timed_out", "timeout", "denied"}:
+                        failures.append(True)
+                    elif status in {"ok", "success", "succeeded", "completed", "passed"}:
+                        successes.append(True)
+                visit(item)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(value)
+    if failures:
+        return "failed"
+    if successes:
+        return "success"
+
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(value)
+    match = re.search(r"(?:exit_code|exit code|returncode)[\"']?\s*[:=]?\s*(-?\d+)", text, re.I)
+    if match:
+        return "success" if int(match.group(1)) == 0 else "failed"
+    if re.search(r"\bprocess exited with code\s+[1-9]\d*\b", text, re.I):
+        return "failed"
+    if re.search(r"\b(?:permission denied|timed out|tool call failed)\b", text, re.I):
+        return "failed"
+    if "Done!" in text or re.search(r"\bprocess exited with code\s+0\b", text, re.I):
+        return "success"
+    return "unknown"
+
+
+def bash_command(payload):
+    tool_input = payload.get("tool_input")
+    if isinstance(tool_input, dict):
+        command = tool_input.get("command")
+        if isinstance(command, str):
+            return command
+    return ""
+
+
+def classify_tool(payload):
+    tool_name = str(payload.get("tool_name") or "")
+    lowered = tool_name.lower()
+    if lowered in {"apply_patch", "edit", "write"}:
+        return "mutation", "file edit"
+    if lowered != "bash":
+        return "activity", "tool activity"
+
+    command = bash_command(payload)
+    if "completion_guard.py" in command or "task-completion-guard" in command:
+        return "guard", "guard command"
+    for label, pattern in VERIFICATION_PATTERNS:
+        if pattern.search(command):
+            return "verification", label
+    if MUTATION_RE.search(command):
+        return "mutation", "shell mutation"
+    return "activity", "shell activity"
+
+
+def refine_guarded_bash_kind(payload, kind, label):
+    """Conservatively classify an otherwise unknown Bash command.
+
+    This refinement is only used after a task is active or suspended, so
+    ordinary read-only investigation cannot enroll a task by itself. An
+    unknown command may be a project-specific generator or rewrite script;
+    treating it as a possible mutation makes any earlier verification stale.
+    """
+    if str(payload.get("tool_name") or "").lower() != "bash" or kind != "activity":
+        return kind, label
+    command = bash_command(payload)
+    if READ_ONLY_BASH_RE.fullmatch(command):
+        return kind, label
+    return "possible_mutation", "unclassified shell command"
+
+
+def event_directory(session_dir, task_id):
+    return session_dir / "events" / task_id
+
+
+def record_event(session_dir, state, payload, kind, label):
+    tool_use_id = payload.get("tool_use_id")
+    if isinstance(tool_use_id, str) and tool_use_id:
+        event_key = digest(tool_use_id)
+    else:
+        event_key = digest(
+            {
+                "turn": payload.get("turn_id"),
+                "tool": payload.get("tool_name"),
+                "input": payload.get("tool_input"),
+                "pid": os.getpid(),
+                "time": time.time_ns(),
+            }
+        )
+    directory = event_directory(session_dir, state["task_id"])
+    path = directory / (event_key + ".json")
+    if path.exists():
+        return
+    event = {
+        "schema_version": SCHEMA_VERSION,
+        "task_id": state["task_id"],
+        "event_id": event_key,
+        "at_ns": time.time_ns(),
+        "tool_name": str(payload.get("tool_name") or "unknown")[:80],
+        "kind": kind,
+        "label": label,
+        "outcome": response_outcome(payload.get("tool_response")),
+        "input_hash": digest(payload.get("tool_input")),
+        "response_hash": digest(payload.get("tool_response")),
+    }
+    atomic_write_json(path, event)
+
+
+def read_events(session_dir, task_id):
+    directory = event_directory(session_dir, task_id)
+    if not directory.exists():
+        return []
+    events = []
+    for path in list(directory.glob("*.json"))[:2000]:
+        try:
+            with open(str(path), "r", encoding="utf-8") as handle:
+                event = json.load(handle)
+            if isinstance(event, dict) and event.get("task_id") == task_id:
+                events.append(event)
+        except (OSError, ValueError):
+            continue
+    events.sort(key=lambda item: int(item.get("at_ns") or 0))
+    return events
+
+
+def parse_marker(message):
+    if not isinstance(message, str) or not message:
+        return None, "completion marker is missing", "missing"
+    tail = message[-MAX_MARKER_BYTES:]
+    matches = list(MARKER_RE.finditer(tail))
+    if not matches:
+        return None, "completion marker is missing", "missing"
+    raw = matches[-1].group(1).strip()
+    try:
+        marker = json.loads(raw)
+    except ValueError:
+        return None, "completion marker is not valid JSON", digest(raw)
+    if not isinstance(marker, dict):
+        return None, "completion marker must be a JSON object", digest(raw)
+    return marker, None, digest(raw)
+
+
+def nonempty_text(value, minimum=1):
+    return isinstance(value, str) and len(value.strip()) >= minimum
+
+
+def evidence_summary(events):
+    mutations = [
+        event
+        for event in events
+        if event.get("kind") in {"mutation", "possible_mutation"}
+    ]
+    observed_mutations = [event for event in mutations if event.get("outcome") != "failed"]
+    verifications = [event for event in events if event.get("kind") == "verification"]
+    failures = [event for event in events if event.get("outcome") == "failed"]
+    # A failed mutation attempt can still have changed files before failing.
+    # Every definite or possible mutation therefore invalidates older checks,
+    # while observed_mutations remains limited to non-failed events for the
+    # separate "a change actually succeeded" completion requirement.
+    last_mutation_ns = max([int(event.get("at_ns") or 0) for event in mutations] or [0])
+    fresh_verifications = [
+        event
+        for event in verifications
+        if event.get("outcome") == "success" and int(event.get("at_ns") or 0) > last_mutation_ns
+    ]
+    later_failed_verifications = [
+        event
+        for event in verifications
+        if event.get("outcome") == "failed" and int(event.get("at_ns") or 0) > last_mutation_ns
+    ]
+    return {
+        "mutations": mutations,
+        "observed_mutations": observed_mutations,
+        "verifications": verifications,
+        "fresh_verifications": fresh_verifications,
+        "later_failed_verifications": later_failed_verifications,
+        "failures": failures,
+    }
+
+
+def validate_complete(marker, state, facts):
+    errors = []
+    criteria = marker.get("criteria")
+    if not isinstance(criteria, list):
+        errors.append("criteria must be an array")
+        criteria = []
+    if len(criteria) < int(state.get("minimum_criteria") or 1):
+        errors.append(
+            "at least %d meaningful criteria are required"
+            % int(state.get("minimum_criteria") or 1)
+        )
+
+    seen = set()
+    for index, criterion in enumerate(criteria):
+        prefix = "criterion %d" % (index + 1)
+        if not isinstance(criterion, dict):
+            errors.append(prefix + " must be an object")
+            continue
+        criterion_id = criterion.get("id")
+        if not nonempty_text(criterion_id):
+            errors.append(prefix + " needs an id")
+        elif criterion_id in seen:
+            errors.append(prefix + " duplicates id " + str(criterion_id))
+        else:
+            seen.add(criterion_id)
+        if not nonempty_text(criterion.get("description"), 4):
+            errors.append(prefix + " needs a meaningful description")
+        status = criterion.get("status")
+        if status not in {"done", "waived"}:
+            errors.append(prefix + " is not done or explicitly waived")
+        elif status == "done" and not nonempty_text(criterion.get("evidence"), 3):
+            errors.append(prefix + " needs concrete evidence")
+        elif status == "waived" and not nonempty_text(criterion.get("reason"), 6):
+            errors.append(prefix + " needs a specific waiver reason")
+
+    remaining = marker.get("remaining")
+    if not isinstance(remaining, list) or remaining:
+        errors.append("remaining must be an empty array")
+    if not nonempty_text(marker.get("summary"), 4):
+        errors.append("a completion summary is required")
+
+    verification = marker.get("verification")
+    if not isinstance(verification, dict):
+        errors.append("verification must be an object")
+    else:
+        status = verification.get("status")
+        if status == "passed":
+            if not facts["fresh_verifications"]:
+                errors.append("no successful verification was observed after the final mutation")
+            if facts["later_failed_verifications"]:
+                errors.append("a verification command failed after the final mutation")
+            if not nonempty_text(verification.get("summary"), 3):
+                errors.append("verification needs a concrete summary")
+        elif status == "not_applicable":
+            if not nonempty_text(verification.get("reason"), 6):
+                errors.append("not_applicable verification needs a specific reason")
+        else:
+            errors.append("verification.status must be passed or not_applicable")
+
+    if facts["later_failed_verifications"]:
+        failure_error = "a verification command failed after the final mutation"
+        if failure_error not in errors:
+            errors.append(failure_error)
+
+    if not facts["observed_mutations"] and not nonempty_text(marker.get("no_change_reason"), 6):
+        errors.append("no successful change was observed; provide a specific no_change_reason")
+    return errors
+
+
+def validate_disposition(marker, state, facts):
+    errors = []
+    if marker.get("version") != SCHEMA_VERSION:
+        errors.append("marker version must be 1")
+    if marker.get("task_id") != state.get("task_id"):
+        errors.append("marker task_id does not match the active task")
+    status = marker.get("status")
+    if status == "complete":
+        errors.extend(validate_complete(marker, state, facts))
+        return "completed", errors
+    if status == "needs_user":
+        if not nonempty_text(marker.get("question"), 4):
+            errors.append("needs_user requires a concrete question")
+        if not nonempty_text(marker.get("why_required"), 6):
+            errors.append("needs_user requires why_required")
+        pending = marker.get("pending_criteria")
+        if not isinstance(pending, list) or not pending:
+            errors.append("needs_user requires pending_criteria")
+        return "waiting_user", errors
+    if status == "blocked":
+        if not nonempty_text(marker.get("reason"), 8):
+            errors.append("blocked requires a specific reason")
+        if not facts["failures"]:
+            errors.append("blocked requires an observed failed or denied tool event")
+        return "blocked_external", errors
+    errors.append("status must be complete, needs_user, or blocked")
+    return "active", errors
+
+
+def continuation_reason(state, errors, facts, attempt):
+    lines = [
+        "%s task=%s attempt=%d/%d]"
+        % (CONTINUATION_PREFIX, state["task_id"], attempt, MAX_BLOCKS),
+        "The execution task has not passed its completion audit:",
+    ]
+    for error in errors[:8]:
+        lines.append("- " + error)
+    if len(errors) > 8:
+        lines.append("- %d additional audit issue(s)" % (len(errors) - 8))
+    lines.append(
+        "Observed evidence: %d change event(s), %d verification event(s), %d fresh successful verification(s)."
+        % (
+            len(facts["observed_mutations"]),
+            len(facts["verifications"]),
+            len(facts["fresh_verifications"]),
+        )
+    )
+    lines.append(
+        "Re-read the complete user request and project instructions, continue the unfinished work, "
+        "run appropriate verification after the final change, and submit a corrected structured "
+        "completion marker. Do not respond with only a progress summary."
+    )
+    return "\n".join(lines)[:4000]
+
+
+def handle_user_prompt(payload, root):
+    session_dir, session_key, cwd_key = session_directory(root, payload)
+    state_path = session_dir / "active.json"
+    prompt = str(payload.get("prompt") or "")
+    prompt_hash = digest(prompt)
+    with locked(session_dir):
+        try:
+            state = read_state(state_path)
+        except CorruptState:
+            state = None
+
+        if state:
+            stop_state = state.get("stop") or {}
+            expected_hash = stop_state.get("last_reason_hash")
+            is_own_continuation = prompt_hash == expected_hash or (
+                prompt.startswith(CONTINUATION_PREFIX) and state.get("task_id") in prompt
+            )
+            if is_own_continuation:
+                state["phase"] = "active"
+                write_state(state_path, state)
+                emit(additional_context("UserPromptSubmit", guard_context(state, "continuation")))
+                return
+
+        classification = classify_prompt(prompt, payload.get("permission_mode"))
+        if classification == "cancel":
+            if state:
+                state["phase"] = "cancelled"
+                write_state(state_path, state)
+            emit({})
+            return
+
+        if classification == "exempt" and state and state.get("phase") in {"active", "suspended"}:
+            state["phase"] = "suspended"
+            write_state(state_path, state)
+            emit({})
+            return
+
+        if state and state.get("phase") == "waiting_user":
+            state["phase"] = "active"
+            state["stop"] = {
+                "block_count": 0,
+                "stalled_count": 0,
+                "last_signature": None,
+                "last_reason_hash": None,
+            }
+            write_state(state_path, state)
+            emit(additional_context("UserPromptSubmit", guard_context(state, "user response received")))
+            return
+
+        if state and state.get("phase") in {"active", "suspended"} and RESUME_RE.match(prompt.strip()):
+            state["phase"] = "active"
+            state["stop"] = {
+                "block_count": 0,
+                "stalled_count": 0,
+                "last_signature": None,
+                "last_reason_hash": None,
+            }
+            write_state(state_path, state)
+            emit(additional_context("UserPromptSubmit", guard_context(state, "task resumed")))
+            return
+
+        if state and state.get("phase") == "active":
+            # A real user message arriving during active work is treated as an addendum.
+            state["minimum_criteria"] = max(
+                int(state.get("minimum_criteria") or 1), minimum_criteria(prompt)
+            )
+            state["stop"] = {
+                "block_count": 0,
+                "stalled_count": 0,
+                "last_signature": None,
+                "last_reason_hash": None,
+            }
+            write_state(state_path, state)
+            emit(additional_context("UserPromptSubmit", guard_context(state, "user addendum")))
+            return
+
+        if classification == "enforce":
+            state = new_state(
+                payload,
+                session_key,
+                cwd_key,
+                "explicit_execution_prompt",
+                minimum_criteria(prompt),
+            )
+            write_state(state_path, state)
+            emit(additional_context("UserPromptSubmit", guard_context(state, "execution request")))
+            return
+
+        if state and state.get("phase") not in TERMINAL_PHASES:
+            state["phase"] = "suspended"
+            write_state(state_path, state)
+        emit({})
+
+
+def handle_post_tool(payload, root):
+    session_dir, session_key, cwd_key = session_directory(root, payload)
+    state_path = session_dir / "active.json"
+    kind, label = classify_tool(payload)
+    newly_armed = False
+    with locked(session_dir):
+        state = read_state(state_path)
+        if state and state.get("phase") in {"active", "suspended"}:
+            kind, label = refine_guarded_bash_kind(payload, kind, label)
+        if state is None and kind == "mutation":
+            state = new_state(payload, session_key, cwd_key, "mutation_observed", 2)
+            write_state(state_path, state)
+            newly_armed = True
+        elif (
+            state
+            and state.get("phase") == "suspended"
+            and kind in {"mutation", "possible_mutation"}
+        ):
+            state["phase"] = "active"
+            write_state(state_path, state)
+            newly_armed = True
+
+    if state and state.get("phase") == "active" and kind != "guard":
+        record_event(session_dir, state, payload, kind, label)
+
+    if newly_armed:
+        emit(
+            additional_context(
+                "PostToolUse",
+                guard_context(state, "a repository mutation automatically enrolled the task"),
+            )
+        )
+    else:
+        emit({})
+
+
+def handle_stop(payload, root):
+    session_dir, _, _ = session_directory(root, payload)
+    state_path = session_dir / "active.json"
+    with locked(session_dir):
+        try:
+            state = read_state(state_path)
+        except CorruptState:
+            fail_open("state_corrupt")
+            return
+        if state is None or state.get("phase") in TERMINAL_PHASES | {"suspended", "degraded"}:
+            emit({})
+            return
+
+        stop_state = state.setdefault(
+            "stop",
+            {
+                "block_count": 0,
+                "stalled_count": 0,
+                "last_signature": None,
+                "last_reason_hash": None,
+            },
+        )
+        marker, marker_error, marker_hash = parse_marker(payload.get("last_assistant_message"))
+        events = read_events(session_dir, state["task_id"])
+        facts = evidence_summary(events)
+        if marker_error:
+            disposition = "active"
+            errors = [marker_error]
+        else:
+            disposition, errors = validate_disposition(marker, state, facts)
+
+        if not errors and disposition in {"completed", "waiting_user", "blocked_external"}:
+            state["phase"] = disposition
+            state["completion_marker_hash"] = marker_hash
+            write_state(state_path, state)
+            emit({})
+            return
+
+        event_signature = [
+            (event.get("event_id"), event.get("kind"), event.get("outcome")) for event in events
+        ]
+        signature = digest({"marker": marker_hash, "events": event_signature, "errors": errors})
+        block_count = int(stop_state.get("block_count") or 0)
+        stalled_count = int(stop_state.get("stalled_count") or 0)
+        if signature == stop_state.get("last_signature"):
+            stalled_count += 1
+        else:
+            stalled_count = 0
+
+        if block_count >= MAX_BLOCKS or stalled_count >= 2:
+            state["phase"] = "degraded"
+            state["degraded_reason"] = (
+                "max_blocks" if block_count >= MAX_BLOCKS else "no_observable_progress"
+            )
+            stop_state["stalled_count"] = stalled_count
+            write_state(state_path, state)
+            fail_open(state["degraded_reason"])
+            return
+
+        attempt = block_count + 1
+        reason = continuation_reason(state, errors, facts, attempt)
+        stop_state["block_count"] = attempt
+        stop_state["stalled_count"] = stalled_count
+        stop_state["last_signature"] = signature
+        stop_state["last_reason_hash"] = digest(reason)
+        write_state(state_path, state)
+        emit({"decision": "block", "reason": reason})
+
+
+def handle_interrupt(payload, root):
+    session_dir, _, _ = session_directory(root, payload)
+    state_path = session_dir / "active.json"
+    with locked(session_dir):
+        try:
+            state = read_state(state_path)
+        except CorruptState:
+            emit({})
+            return
+        if state and state.get("phase") == "active":
+            state["phase"] = "suspended"
+            write_state(state_path, state)
+    emit({})
+
+
+def run_hook():
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            raise GuardError("input_not_object")
+        event_name = payload.get("hook_event_name")
+        root = plugin_data_root()
+        if event_name == "UserPromptSubmit":
+            handle_user_prompt(payload, root)
+        elif event_name == "PostToolUse":
+            handle_post_tool(payload, root)
+        elif event_name == "Stop":
+            handle_stop(payload, root)
+        elif event_name == "Interrupt":
+            handle_interrupt(payload, root)
+        else:
+            emit({})
+    except (GuardError, OSError, ValueError, TypeError):
+        fail_open("hook_runtime_error")
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] != "hook":
+        sys.stderr.write("usage: completion_guard.py hook\n")
+        return 2
+    run_hook()
+    return 0
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    sys.exit(main(sys.argv))
