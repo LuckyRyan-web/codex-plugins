@@ -20,8 +20,11 @@ import secrets
 import sys
 import tempfile
 import shlex
+import xml.etree.ElementTree as ET
 
 from verification_output import response_outcome
+import review_gate
+from review_snapshot import SnapshotError
 import time
 
 try:
@@ -324,6 +327,7 @@ def new_state(payload, session_key, cwd_key, source, minimum):
         "prompt_hash": digest(str(payload.get("prompt") or "")),
         "created_at_ns": now,
         "updated_at_ns": now,
+        "review": {"version": 1, "attempts": [], "starts": {}, "current": None},
         "stop": {
             "block_count": 0,
             "stalled_count": 0,
@@ -400,7 +404,7 @@ def guard_context(state, activation_note=None):
         "Keep the final answer natural and do not narrate audit retries."
         % (state["task_id"], note, state["minimum_criteria"], command,
            json.dumps(audit_example(state), ensure_ascii=False))
-    )
+    ) + review_gate.context(state)
 
 
 def additional_context(event_name, text):
@@ -716,7 +720,17 @@ def handle_user_prompt(payload, root):
     session_dir, session_key, cwd_key = session_directory(root, payload)
     state_path = session_dir / "active.json"
     prompt = str(payload.get("prompt") or "")
-    prompt_hash = digest(prompt)
+    # Codex can wrap an automatic reason in hook_prompt. Only unwrap this
+    # known wrapper; quoted user text must not reset or impersonate a retry.
+    continuation_text = prompt
+    if prompt.lstrip().startswith("<hook_prompt"):
+        try:
+            wrapper = ET.fromstring(prompt.strip())
+            if wrapper.tag == "hook_prompt" and not list(wrapper):
+                continuation_text = (wrapper.text or "").strip()
+        except ET.ParseError:
+            pass
+    prompt_hash = digest(continuation_text)
     with locked(session_dir):
         try:
             state = read_state(state_path)
@@ -728,7 +742,7 @@ def handle_user_prompt(payload, root):
             stop_state = state.get("stop") or {}
             expected_hash = stop_state.get("last_reason_hash")
             is_own_continuation = prompt_hash == expected_hash or (
-                prompt.startswith(CONTINUATION_PREFIX) and state.get("task_id") in prompt
+                continuation_text.startswith(CONTINUATION_PREFIX) and state.get("task_id") in continuation_text
             )
             if is_own_continuation:
                 state["phase"] = "active"
@@ -738,6 +752,7 @@ def handle_user_prompt(payload, root):
 
         if state:
             state["audit_not_before_ns"] = time.time_ns()
+            review_gate.add_user_context(state, prompt)
         classification = classify_prompt(prompt, payload.get("permission_mode"))
         if classification == "cancel":
             if state:
@@ -800,6 +815,7 @@ def handle_user_prompt(payload, root):
                 minimum_criteria(prompt),
             )
             ensure_file_protocol(state, session_dir)
+            review_gate.add_user_context(state, prompt)
             write_state(state_path, state)
             emit(additional_context("UserPromptSubmit", guard_context(state, "execution request")))
             return
@@ -818,6 +834,23 @@ def handle_post_tool(payload, root):
     migrated = False
     with locked(session_dir):
         state = read_state(state_path)
+        if state and state.get("review"):
+            try:
+                handled = review_gate.after_tool(state, payload)
+                if handled:
+                    write_state(state_path, state)
+                    emit(additional_context("PostToolUse", "Review claim recorded. Continue the read-only review and return its report to the parent." if payload.get("agent_id") else review_gate.context(state)))
+                    return
+            except (OSError, ValueError, SnapshotError) as exc:
+                state["review"]["last_error"] = str(exc)
+                write_state(state_path, state)
+                emit(additional_context("PostToolUse", "Independent review: " + str(exc)))
+                return
+        # Child tools carry the parent session_id. They are not evidence that
+        # the coding task changed files or ran a successful verification.
+        if payload.get("agent_id"):
+            emit({})
+            return
         if state and state.get("phase") in {"active", "suspended"}:
             migrated = ensure_file_protocol(state, session_dir)
             if migrated:
@@ -827,6 +860,7 @@ def handle_post_tool(payload, root):
         if state is None and kind == "mutation":
             state = new_state(payload, session_key, cwd_key, "mutation_observed", 2)
             ensure_file_protocol(state, session_dir)
+            review_gate.add_user_context(state, "")
             write_state(state_path, state)
             newly_armed = True
         elif (
@@ -882,6 +916,8 @@ def handle_stop(payload, root):
             errors = [marker_error]
         else:
             disposition, errors = validate_disposition(marker, state, facts)
+            if disposition == "completed":
+                errors.extend(review_gate.completion_errors(state))
 
         if not errors and disposition in {"completed", "waiting_user", "blocked_external"}:
             state["phase"] = disposition
@@ -907,6 +943,8 @@ def handle_stop(payload, root):
             state["degraded_reason"] = (
                 "max_blocks" if block_count >= MAX_BLOCKS else "no_observable_progress"
             )
+            if state.get("review"):
+                state["review"]["completion_status"] = "unverified"
             stop_state["stalled_count"] = stalled_count
             write_state(state_path, state)
             fail_open(state["degraded_reason"])
@@ -937,6 +975,35 @@ def handle_interrupt(payload, root):
     emit({})
 
 
+def handle_review_event(payload, root):
+    session_dir, _, _ = session_directory(root, payload)
+    state_path = session_dir / "active.json"
+    with locked(session_dir):
+        state = read_state(state_path)
+        if not state or not state.get("review"):
+            emit({})
+            return
+        event = payload["hook_event_name"]
+        if event == "PreToolUse":
+            try:
+                denial = review_gate.before_tool(state, payload)
+            except (OSError, ValueError, SnapshotError) as exc:
+                denial = "独立验收尚未就绪：" + str(exc)
+            write_state(state_path, state)
+            if denial:
+                emit({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                      "permissionDecision": "deny", "permissionDecisionReason": denial}})
+            else:
+                emit({})
+            return
+        if event == "SubagentStart":
+            review_gate.subagent_start(state, payload)
+        elif event == "SubagentStop":
+            review_gate.subagent_stop(state, payload, session_dir)
+        write_state(state_path, state)
+    emit({})
+
+
 def run_hook():
     try:
         payload = json.load(sys.stdin)
@@ -952,9 +1019,11 @@ def run_hook():
             handle_stop(payload, root)
         elif event_name == "Interrupt":
             handle_interrupt(payload, root)
+        elif event_name in {"PreToolUse", "SubagentStart", "SubagentStop"}:
+            handle_review_event(payload, root)
         else:
             emit({})
-    except (GuardError, OSError, ValueError, TypeError):
+    except (GuardError, OSError, ValueError, TypeError, SnapshotError):
         fail_open("hook_runtime_error")
 
 
@@ -975,6 +1044,25 @@ def submit_audit(filename):
 
 
 def main(argv):
+    if len(argv) >= 2 and argv[1] in {"prepare-review", "review-claim"}:
+        try:
+            if len(argv) == 4 and argv[1:3] == ["prepare-review", "--audit-file"]:
+                raw = sys.stdin.buffer.read(MAX_MARKER_BYTES + 1)
+                if len(raw) > MAX_MARKER_BYTES:
+                    raise ValueError("preparation exceeds 64 KiB")
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("preparation must be a JSON object")
+                result = review_gate.prepare(argv[3], data, os.getcwd())
+            elif len(argv) == 6 and argv[1:3] == ["review-claim", "--audit-file"] and argv[4] == "--run-id":
+                result = review_gate.claim(argv[3], argv[5])
+            else:
+                raise ValueError("invalid independent review command")
+            emit(result)
+            return 0
+        except (OSError, ValueError, KeyError, TypeError, SnapshotError) as exc:
+            sys.stderr.write("Independent review unavailable: %s\n" % exc)
+            return 2
     if len(argv) == 4 and argv[1:3] == ["submit", "--audit-file"]:
         try:
             submit_audit(argv[3])

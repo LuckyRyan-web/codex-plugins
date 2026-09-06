@@ -26,7 +26,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Compile hook
-        run: python -m py_compile plugins/task-completion-guard/scripts/completion_guard.py
+        run: python -m compileall -q plugins/task-completion-guard/scripts
 
       - name: Test release package
         run: python -m unittest discover -s tests -p "test_*.py"

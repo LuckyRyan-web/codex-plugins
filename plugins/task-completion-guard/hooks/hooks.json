@@ -15,7 +15,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Bash|apply_patch|Edit|Write)$",
+        "matcher": "^(Bash|apply_patch|Edit|Write|Agent|spawn_agent|collaborationspawn_agent|collaboration[._]spawn_agent)$",
         "hooks": [
           {
             "type": "command",
@@ -44,6 +44,39 @@
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/completion_guard.py\" hook",
             "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/completion_guard.py\" hook",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/completion_guard.py\" hook",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/completion_guard.py\" hook",
+            "timeout": 8
           }
         ]
       }

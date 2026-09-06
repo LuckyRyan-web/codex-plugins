@@ -2,6 +2,25 @@
 
 All notable changes to this repository are documented here.
 
+## [Unreleased]
+
+### 新增
+
+- 独立完成验收：`prepare-review` 保存私有要求、文件快照和 diff；主 Agent
+  使用原生 `spawn_agent` 原样传入交接，以 `fork_turns: "none"` 创建子 Agent。
+- 子 Agent 首先 `review-claim`，通过宿主 `agent_id` 绑定身份；从
+  `SubagentStop` 收集真实报告，并在结束前核对要求与当前代码快照。
+- 风险分流：`routine` 仅限不超过 1 文件、20 行的细小低风险调整；`auto` 对
+  代码/配置、超过 2 文件或 80 行的改动要求验收；`important` 和 critical 路径
+  始终要求验收。每个任务最多初次验收加一次修复后复审。
+
+### 调整
+
+- 子 Agent 工具事件不计入主任务修改与验证证据；旧 active 状态保持原有协议。
+- 文档说明独立验收的额度消耗，以及原始用户请求、代码、diff 和报告的私有存储；
+  Python 脚本本身不发起模型请求。
+- 明确读取限制不是操作系统 sandbox；fail-open 不等于独立验收通过。
+
 ## [0.1.0] - 2026-09-04
 
 ### Added

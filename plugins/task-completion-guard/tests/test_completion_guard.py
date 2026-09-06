@@ -68,6 +68,13 @@ class CompletionGuardTests(unittest.TestCase):
         self.assertIsNotNone(match, context)
         return match.group(1), context
 
+    def use_legacy_active_task(self):
+        # Existing tasks must retain the pre-independent-review completion
+        # contract when a plugin is upgraded in the middle of their work.
+        state = self.read_state()
+        state.pop("review", None)
+        self.active_state_path().write_text(json.dumps(state))
+
     def active_state_path(self):
         paths = list(self.data.rglob("active.json"))
         self.assertEqual(len(paths), 1)
@@ -235,6 +242,7 @@ class CompletionGuardTests(unittest.TestCase):
 
     def test_successful_change_and_fresh_verification_allow_completion(self):
         task_id, _ = self.start_task()
+        self.use_legacy_active_task()
         self.post_patch()
         self.post_verification()
         message = self.complete_marker(task_id)
@@ -311,6 +319,7 @@ class CompletionGuardTests(unittest.TestCase):
 
     def test_no_change_requires_specific_reason(self):
         task_id, _ = self.start_task("请修改这个配置")
+        self.use_legacy_active_task()
         self.post_verification()
         output, _ = self.run_hook(
             "Stop", last_assistant_message=self.complete_marker(task_id, count=1)
@@ -328,6 +337,7 @@ class CompletionGuardTests(unittest.TestCase):
 
     def test_not_applicable_verification_requires_reason_but_can_pass(self):
         task_id, _ = self.start_task("请修改这个配置")
+        self.use_legacy_active_task()
         self.post_patch()
         output, _ = self.run_hook(
             "Stop",
@@ -474,7 +484,7 @@ class PackageContractTests(unittest.TestCase):
         hooks = json.loads(HOOKS.read_text())
         self.assertEqual(
             set(hooks["hooks"]),
-            {"UserPromptSubmit", "PostToolUse", "Stop", "Interrupt"},
+            {"UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "Stop", "Interrupt"},
         )
         for entries in hooks["hooks"].values():
             for entry in entries:

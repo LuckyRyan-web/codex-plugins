@@ -16,7 +16,9 @@ It combines:
 - a skill that tells Codex to derive acceptance criteria from the complete
   natural-language request;
 - lifecycle hooks that enroll execution tasks and observe local change and
-  verification events; and
+  verification events;
+- an independent reviewer that checks a fixed snapshot without inheriting the
+  coding conversation; and
 - a Stop hook that blocks a premature finish and returns concrete audit gaps to
   Codex.
 
@@ -57,7 +59,7 @@ Then pick the matching surface:
 - **Codex CLI:** exit any session that was already running, then start a new
   `codex` session.
 
-In the new task or session, enter `/hooks`, review the four hooks from Task
+In the new task or session, enter `/hooks`, review the seven hooks from Task
 Completion Guard, and trust them.
 
 To pin the marketplace itself to the first release instead of following
@@ -88,19 +90,61 @@ To opt out for one request, include:
 
 ### How it works
 
-The plugin listens to four lifecycle events:
+The plugin listens to seven lifecycle events:
 
 | Event | Purpose |
 | --- | --- |
 | `UserPromptSubmit` | Classify the request and inject the completion protocol for execution work. |
-| `PostToolUse` | Record hashed evidence about file mutations, shell mutations, verification commands, and their outcomes. |
+| `PreToolUse` | Check the exact review handoff, `fork_turns: "none"`, attempt limit, and snapshot; restrict tools for the bound reviewer. |
+| `PostToolUse` | Record the parent's change and verification evidence; observe review preparation, spawn acknowledgement, and the child's identity claim. |
+| `SubagentStart` | Record the child identity supplied by the host. |
+| `SubagentStop` | Collect the actual review report from that child's final message. |
 | `Stop` | Validate the structured completion declaration and block an incomplete finish. |
 | `Interrupt` | Suspend the active guard when the user explicitly interrupts the task. |
 
-For an active task, Codex submits a JSON declaration through the stdin of the
-command supplied by the hook. The command writes a private local audit file;
-the user-facing answer contains no audit JSON or completion marker. Submit the
-declaration after the final business change and verification, including:
+Before a new task completes, Codex runs the hook-supplied `prepare-review`
+command with acceptance requirements, file paths, risk, and actual verification
+evidence on stdin. It saves a private request, file copies, diff, and digests;
+it does not call a model. Git snapshots include every dirty and untracked file,
+including existing changes; explicit `paths` cannot exclude them. Non-Git
+directories require explicit file paths.
+
+The captured scope and `risk` determine whether an independent review is needed:
+
+| Condition | Independent review |
+| --- | --- |
+| `risk: "important"`, or a critical path match such as authentication, permissions, payments, or migrations | Required. |
+| `risk: "routine"` | Reserved for tiny, low-risk wording or formatting changes. Exempt only at no more than 1 file and 20 changed lines; critical paths still require review. |
+| Default `risk: "auto"` | Required for code/configuration files, more than 2 files, or more than 80 changed lines. |
+
+Changed lines count additions plus deletions; non-Git files count their full
+contents. Critical is a path classification, not a fourth `risk` value. Use
+`important` for business logic, permissions, data, or consequential behavior.
+Do not label such work `routine` to skip review.
+
+When required, the parent passes the returned `spawn` fields **unchanged** to
+the native `spawn_agent` tool, explicitly using `fork_turns: "none"`. It creates
+a fresh child context without copying the coding chat or creating a separate
+user-facing task. The child first runs the exact `review-claim` command in the
+handoff. Hooks bind the review to its host-provided `agent_id`, then collect the
+actual report from `SubagentStop.last_assistant_message`. A parent-authored
+claim that review passed is not review evidence.
+
+The bound reviewer reads the generated `diff.patch`, snapshot, and necessary
+dependencies with allowed commands such as `cat` and `rg`. It does not run Git
+commands directly, because repository content filters can execute programs.
+
+Each task allows at most two independent reviews: the initial review and one
+review after fixes. Fix findings, verify, and prepare again only after code or
+requirements change. Do not repeatedly retry capacity or quota errors. For a
+task requiring review, completion requires every criterion to pass, no remaining
+findings, and the reviewed snapshot and user requirements to remain current.
+An unfinished review must be reported as unverified.
+
+Finally, Codex submits a JSON declaration through the hook-supplied `submit`
+command's stdin. The command writes a private local audit file; the user-facing
+answer contains no audit JSON or completion marker. Submit it after the final
+business change, verification, and any required independent review, including:
 
 - meaningful acceptance criteria derived from the entire request;
 - a status and concrete evidence for every criterion;
@@ -115,28 +159,40 @@ If the audit fails, the Stop hook blocks with a short visible continuation
 message. It saves detailed findings locally and supplies them to Codex through
 internal hook context on continuation. Blocking is deliberately bounded to
 three attempts, and repeated runs without observable progress degrade to
-fail-open behavior rather than trapping the session forever.
+fail-open behavior rather than trapping the session forever. This is separate
+from the two-review limit; a fail-open release is not a passing review.
+
+Already-active tasks from older versions without a `review` state retain their
+existing completion protocol. New tasks use the review workflow above.
 
 ### Data and privacy
 
-The hook runs locally and does not send telemetry or task data to a remote
-service.
+The Python scripts run locally without making model requests or sending
+telemetry. The independent child normally calls the current Codex model and
+consumes account usage. The handoff's user requirements, and code or evidence
+the child reads, enter that child's model context. Model overrides are omitted
+by default.
 
 Task state, event records, and audit diagnostics are written beneath
 `PLUGIN_DATA/completion-guard/v1/sessions/<session-hash>/`. They include task
 metadata, the audit-file path, event classifications, timestamps, outcomes,
-SHA-256 hashes, diagnostic errors, and verification counts. Automatic
-recording hashes prompt and tool data instead of retaining their raw contents;
-the hook does not parse the Codex transcript format.
+SHA-256 hashes, diagnostic errors, and verification counts. Routine event
+records hash prompt and tool data. **Independent review also retains raw user
+requests, requirements, verification descriptions, diffs, file copies, and child
+reports**, so plugin data is not limited to hashes. Review requests in task
+state and accepted reports are retained in this private data directory. The
+hook does not parse the Codex transcript format.
 
 The submitted JSON declaration is stored separately beneath the system
 temporary directory at
 `codex-task-completion-guard/<session-hash>/<task-id>.json`. It contains the
 model's acceptance criteria, evidence descriptions, summary, and any stated
-question or blocker, so it can contain task-related text. On POSIX systems, new private
-directories and JSON files use permissions `0700` and `0600`, respectively.
-The plugin does not automatically delete these records or audit files when a
-task completes or is interrupted.
+question or blocker, so it can contain task-related text. Adjacent
+`.context.json`, `.review-request.json`, and `.review-<run-id>/` artifacts retain
+raw requirements, the request, and the snapshot. On POSIX systems, new private
+directories and writable JSON files use `0700` and `0600`; saved snapshot
+directories and files use `0500` and `0400`. These records are not automatically
+deleted on completion or interruption.
 
 See [SECURITY.md](SECURITY.md) for the reporting process and security model.
 
@@ -151,9 +207,15 @@ correctness.
   validates the declaration and observable evidence but cannot prove that every
   business requirement was understood correctly.
 - Hosted or specialized tools may not traverse the local tool-hook path.
-- A nonempty evidence description is not independently verified as a semantic
-  claim.
-- Internal errors and exhausted retry limits fail open.
+- Independent model review can still miss defects and cannot replace checks
+  that were never run.
+- Reviewer read restrictions use prompts and hooks, not a promised operating
+  system sandbox. Local users or malicious processes can alter scripts or
+  state; the plugin is not a boundary against adversarial behavior.
+- Snapshot limits, unsafe file reads, or missing evidence cannot establish a
+  passing review.
+- Internal errors and exhausted retry limits fail open. Unfinished independent
+  review must still be reported as unverified.
 
 ### Update
 

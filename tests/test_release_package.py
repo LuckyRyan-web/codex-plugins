@@ -54,7 +54,8 @@ class ReleasePackageTests(unittest.TestCase):
 
     def test_default_plugin_components_exist(self):
         self.assertTrue(HOOKS_PATH.is_file())
-        self.assertTrue((PLUGIN_ROOT / "scripts" / "completion_guard.py").is_file())
+        for module in ("completion_guard.py", "verification_output.py", "review_gate.py", "review_snapshot.py"):
+            self.assertTrue((PLUGIN_ROOT / "scripts" / module).is_file(), module)
         self.assertTrue(
             (PLUGIN_ROOT / "skills" / "task-completion-guard" / "SKILL.md").is_file()
         )
@@ -62,7 +63,7 @@ class ReleasePackageTests(unittest.TestCase):
         hooks = load_json(HOOKS_PATH)
         self.assertEqual(
             set(hooks["hooks"]),
-            {"UserPromptSubmit", "PostToolUse", "Stop", "Interrupt"},
+            {"UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "Stop", "Interrupt"},
         )
         serialized = json.dumps(hooks)
         self.assertIn("${PLUGIN_ROOT}/scripts/completion_guard.py", serialized)

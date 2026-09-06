@@ -69,6 +69,11 @@ class SidecarAuditTests(unittest.TestCase):
     def start(self):
         output = self.hook("UserPromptSubmit", prompt="请帮我修复导出功能")
         state = self.state()
+        # Regression coverage for tasks activated before this upgrade.
+        # New tasks with the same sidecar protocol are exercised end to end
+        # in test_independent_review.py without changing lifecycle state.
+        state.pop("review", None)
+        self.state_path().write_text(json.dumps(state))
         self.assertEqual(state["declaration_protocol"], "file")
         self.assertTrue(Path(state["audit_path"]).is_absolute())
         self.assertGreater(state["audit_not_before_ns"], 0)
