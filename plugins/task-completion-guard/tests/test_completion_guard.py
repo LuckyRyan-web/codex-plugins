@@ -34,6 +34,14 @@ class CompletionGuardTests(unittest.TestCase):
             "model": "test-model",
             "permission_mode": "default",
         }
+        # Legacy test fixtures describe declarations inline; deliver them via
+        # the new file channel and keep the actual final answer plain text.
+        if event_name == "Stop" and isinstance(fields.get("last_assistant_message"), str):
+            match = re.search(r"<!-- task-completion-guard:(.*) -->", fields["last_assistant_message"])
+            if match:
+                state = self.read_state()
+                Path(state["audit_path"]).write_text(match.group(1))
+                fields["last_assistant_message"] = "Finished."
         payload.update(fields)
         env = os.environ.copy()
         env["PLUGIN_DATA"] = str(self.data)
@@ -67,6 +75,11 @@ class CompletionGuardTests(unittest.TestCase):
 
     def read_state(self):
         return json.loads(self.active_state_path().read_text())
+
+    def audit_errors(self):
+        state = self.read_state()
+        report = self.active_state_path().parent / "audits" / state["task_id"] / "latest.json"
+        return "\n".join(json.loads(report.read_text())["errors"])
 
     def criteria_for(self, count):
         return [
@@ -207,8 +220,8 @@ class CompletionGuardTests(unittest.TestCase):
         task_id, _ = self.start_task()
         output, _ = self.run_hook("Stop", last_assistant_message="I changed one file.")
         self.assertEqual(output["decision"], "block")
-        self.assertIn(task_id, output["reason"])
-        self.assertIn("completion marker is missing", output["reason"])
+        self.assertLess(len(output["reason"]), 80)
+        self.assertIn("local completion audit is missing", self.audit_errors())
 
     def test_continuation_prompt_preserves_task(self):
         task_id, _ = self.start_task()
@@ -236,7 +249,7 @@ class CompletionGuardTests(unittest.TestCase):
         message = self.complete_marker(task_id)
         output, _ = self.run_hook("Stop", last_assistant_message=message)
         self.assertEqual(output["decision"], "block")
-        self.assertIn("after the final mutation", output["reason"])
+        self.assertIn("after the final mutation", self.audit_errors())
 
     def test_unknown_bash_after_verification_is_a_possible_mutation(self):
         task_id, _ = self.start_task()
@@ -253,7 +266,7 @@ class CompletionGuardTests(unittest.TestCase):
             "Stop", last_assistant_message=self.complete_marker(task_id)
         )
         self.assertEqual(output["decision"], "block")
-        self.assertIn("after the final mutation", output["reason"])
+        self.assertIn("after the final mutation", self.audit_errors())
 
     def test_failed_unknown_bash_also_invalidates_earlier_verification(self):
         task_id, _ = self.start_task()
@@ -273,7 +286,7 @@ class CompletionGuardTests(unittest.TestCase):
             "Stop", last_assistant_message=self.complete_marker(task_id)
         )
         self.assertEqual(output["decision"], "block")
-        self.assertIn("after the final mutation", output["reason"])
+        self.assertIn("after the final mutation", self.audit_errors())
 
     def test_failed_latest_verification_is_rejected(self):
         task_id, _ = self.start_task()
@@ -284,7 +297,7 @@ class CompletionGuardTests(unittest.TestCase):
             "Stop", last_assistant_message=self.complete_marker(task_id)
         )
         self.assertEqual(output["decision"], "block")
-        self.assertIn("failed after the final mutation", output["reason"])
+        self.assertIn("failed after the final mutation", self.audit_errors())
 
     def test_too_few_criteria_are_rejected(self):
         task_id, _ = self.start_task()
@@ -294,7 +307,7 @@ class CompletionGuardTests(unittest.TestCase):
             "Stop", last_assistant_message=self.complete_marker(task_id, count=1)
         )
         self.assertEqual(output["decision"], "block")
-        self.assertIn("at least 3 meaningful criteria", output["reason"])
+        self.assertIn("at least 3 meaningful criteria", self.audit_errors())
 
     def test_no_change_requires_specific_reason(self):
         task_id, _ = self.start_task("请修改这个配置")
@@ -335,7 +348,7 @@ class CompletionGuardTests(unittest.TestCase):
             ),
         )
         self.assertEqual(output["decision"], "block")
-        self.assertIn("failed after the final mutation", output["reason"])
+        self.assertIn("failed after the final mutation", self.audit_errors())
 
     def test_needs_user_disposition_allows_question(self):
         task_id, _ = self.start_task()
@@ -436,7 +449,7 @@ class CompletionGuardTests(unittest.TestCase):
         self.assertEqual(first["decision"], "block")
         self.assertEqual(second["decision"], "block")
         self.assertIn("systemMessage", third)
-        self.assertIn("failed open", third["systemMessage"])
+        self.assertIn("完成检查暂时不可用", third["systemMessage"])
         self.assertEqual(self.read_state()["phase"], "degraded")
 
     def test_stop_hook_active_turn_is_still_audited(self):
@@ -445,7 +458,7 @@ class CompletionGuardTests(unittest.TestCase):
             "Stop", last_assistant_message="partial", stop_hook_active=True
         )
         self.assertEqual(output["decision"], "block")
-        self.assertIn("completion marker is missing", output["reason"])
+        self.assertIn("local completion audit is missing", self.audit_errors())
         self.assertEqual(self.read_state()["phase"], "active")
 
     def test_corrupt_state_fails_open(self):
@@ -453,7 +466,7 @@ class CompletionGuardTests(unittest.TestCase):
         self.active_state_path().write_text("not json")
         output, _ = self.run_hook("Stop", last_assistant_message="partial")
         self.assertIn("systemMessage", output)
-        self.assertIn("failed open", output["systemMessage"])
+        self.assertIn("完成检查暂时不可用", output["systemMessage"])
 
 
 class PackageContractTests(unittest.TestCase):
@@ -472,7 +485,7 @@ class PackageContractTests(unittest.TestCase):
     def test_manifest_and_skill_have_no_scaffold_placeholders(self):
         manifest = json.loads(MANIFEST.read_text())
         self.assertEqual(manifest["name"], "task-completion-guard")
-        self.assertEqual(manifest["version"], "0.1.0")
+        self.assertEqual(manifest["version"].split("+")[0], "0.1.0")
         combined = MANIFEST.read_text() + SKILL.read_text()
         self.assertNotIn("[TODO:", combined)
 

@@ -97,7 +97,10 @@ The plugin listens to four lifecycle events:
 | `Stop` | Validate the structured completion declaration and block an incomplete finish. |
 | `Interrupt` | Suspend the active guard when the user explicitly interrupts the task. |
 
-For an active task, Codex must declare:
+For an active task, Codex submits a JSON declaration through the stdin of the
+command supplied by the hook. The command writes a private local audit file;
+the user-facing answer contains no audit JSON or completion marker. Submit the
+declaration after the final business change and verification, including:
 
 - meaningful acceptance criteria derived from the entire request;
 - a status and concrete evidence for every criterion;
@@ -108,20 +111,32 @@ For an active task, Codex must declare:
 - a specific external blocker backed by an observed failed or denied tool
   event.
 
-If the audit fails, the Stop hook emits a blocking decision with the missing
-items and Codex gets another opportunity to continue. Blocking is deliberately
-bounded to three attempts, and repeated runs without observable progress
-degrade to fail-open behavior rather than trapping the session forever.
+If the audit fails, the Stop hook blocks with a short visible continuation
+message. It saves detailed findings locally and supplies them to Codex through
+internal hook context on continuation. Blocking is deliberately bounded to
+three attempts, and repeated runs without observable progress degrade to
+fail-open behavior rather than trapping the session forever.
 
 ### Data and privacy
 
 The hook runs locally and does not send telemetry or task data to a remote
 service.
 
-State is written beneath the Codex-provided `PLUGIN_DATA` directory. The
-plugin stores classifications, timestamps, outcomes, and SHA-256 hashes. It is
-designed not to retain raw prompts, tool inputs, or tool outputs, and it does
-not parse the unstable Codex transcript format.
+Task state, event records, and audit diagnostics are written beneath
+`PLUGIN_DATA/completion-guard/v1/sessions/<session-hash>/`. They include task
+metadata, the audit-file path, event classifications, timestamps, outcomes,
+SHA-256 hashes, diagnostic errors, and verification counts. Automatic
+recording hashes prompt and tool data instead of retaining their raw contents;
+the hook does not parse the Codex transcript format.
+
+The submitted JSON declaration is stored separately beneath the system
+temporary directory at
+`codex-task-completion-guard/<session-hash>/<task-id>.json`. It contains the
+model's acceptance criteria, evidence descriptions, summary, and any stated
+question or blocker, so it can contain task-related text. On POSIX systems, new private
+directories and JSON files use permissions `0700` and `0600`, respectively.
+The plugin does not automatically delete these records or audit files when a
+task completes or is interrupted.
 
 See [SECURITY.md](SECURITY.md) for the reporting process and security model.
 

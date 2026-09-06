@@ -2,7 +2,7 @@
 """Lifecycle hook for the Task Completion Guard Codex plugin.
 
 The hook deliberately separates semantic judgment from mechanical checks:
-Codex declares a structured completion audit in its last assistant message,
+Codex saves a structured completion audit in a private local file,
 while this script validates that declaration against observable tool events.
 It never parses the unstable Codex transcript format and never stores raw
 prompts, tool inputs, or tool outputs.
@@ -18,6 +18,10 @@ from pathlib import Path
 import re
 import secrets
 import sys
+import tempfile
+import shlex
+
+from verification_output import response_outcome
 import time
 
 try:
@@ -196,8 +200,7 @@ def fail_open(reason_code):
     emit(
         {
             "systemMessage": (
-                "Task Completion Guard failed open (%s). "
-                "This turn was not completion-checked." % reason_code
+                "完成检查暂时不可用，本次未完成自动验收。"
             )
         }
     )
@@ -295,6 +298,17 @@ def write_state(path, state):
     atomic_write_json(path, state)
 
 
+def ensure_file_protocol(state, session_dir):
+    if state.get("declaration_protocol") == "file":
+        return False
+    folder = Path(tempfile.gettempdir()) / "codex-task-completion-guard" / session_dir.name
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state["declaration_protocol"] = "file"
+    state["audit_path"] = str(folder / (state["task_id"] + ".json"))
+    state["audit_not_before_ns"] = time.time_ns()
+    return True
+
+
 def new_state(payload, session_key, cwd_key, source, minimum):
     now = time.time_ns()
     return {
@@ -355,53 +369,37 @@ def minimum_criteria(prompt):
     return min(minimum, 4)
 
 
-def marker_example(state):
-    criteria = []
-    for index in range(state["minimum_criteria"]):
-        criteria.append(
-            {
-                "id": "C%d" % (index + 1),
-                "description": "meaningful acceptance item %d" % (index + 1),
-                "status": "done",
-                "evidence": "specific file, behavior, or check",
-            }
-        )
-    marker = {
+def audit_example(state):
+    return {
         "version": 1,
         "task_id": state["task_id"],
         "status": "complete",
-        "criteria": criteria,
-        "remaining": [],
-        "summary": "concise completion summary",
+        "criteria": [{"id": "C%d" % (i + 1), "description": "meaningful acceptance item",
+                      "status": "done", "evidence": "specific verification evidence"}
+                     for i in range(state["minimum_criteria"])],
+        "remaining": [], "summary": "concise completion summary",
         "verification": {"status": "passed", "summary": "command or check that passed"},
     }
-    return "<!-- task-completion-guard:%s -->" % json.dumps(
-        marker, ensure_ascii=False, separators=(",", ":")
-    )
 
 
 def guard_context(state, activation_note=None):
-    example = marker_example(state)
-    note = ""
-    if activation_note:
-        note = " Activation: %s." % activation_note
+    command = "python3 %s submit --audit-file %s" % (
+        shlex.quote(str(Path(__file__).resolve())), shlex.quote(state["audit_path"]))
+    note = " Activation: %s." % activation_note if activation_note else ""
     return (
         "Task Completion Guard is ACTIVE for task %s.%s\n"
-        "Treat the user's entire request, applicable AGENTS.md instructions, and required "
-        "integration/verification as one objective. The user does not need to write stop "
-        "conditions or invoke /goal. Do not finish after only an intermediate step or a "
-        "progress report.\n"
-        "Before proposing a final answer, derive and audit at least %d meaningful acceptance "
-        "criteria, finish every criterion, inspect the resulting changes, and run verification "
-        "proportional to risk after the final mutation. Then append exactly one hidden marker "
-        "near the end of the answer using this schema (replace all placeholder text):\n%s\n"
-        "Each done criterion needs specific evidence. If no repository/external change was "
-        "needed, add no_change_reason. Use verification.status=not_applicable only with a "
-        "specific reason. For a genuinely required user decision use status=needs_user with "
-        "question, why_required, and pending_criteria. For an external blocker use "
-        "status=blocked with reason; an observed failed tool event is required. Do not mention "
-        "this internal protocol in the visible answer and do not fabricate evidence."
-        % (state["task_id"], note, state["minimum_criteria"], example)
+        "This local-file declaration protocol supersedes earlier inline/HTML marker instructions. "
+        "Never append an audit marker or audit JSON to the user-facing answer.\n"
+        "Finish the entire authorized task, derive at least %d meaningful acceptance criteria, "
+        "and verify the final changes. Save the audit after all business changes and verification. "
+        "Send this JSON schema to the following command's stdin (replace placeholders with evidence):\n%s\n%s\n"
+        "The command writes only a private temporary audit file. Do not write to plugin state or event logs. "
+        "Use status=needs_user with question, why_required and pending_criteria only for a required user decision; "
+        "use status=blocked with reason only for an observed external blocker. "
+        "Do not fabricate evidence or bypass failed checks. "
+        "Keep the final answer natural and do not narrate audit retries."
+        % (state["task_id"], note, state["minimum_criteria"], command,
+           json.dumps(audit_example(state), ensure_ascii=False))
     )
 
 
@@ -412,52 +410,6 @@ def additional_context(event_name, text):
             "additionalContext": text,
         }
     }
-
-
-def response_outcome(value):
-    failures = []
-    successes = []
-
-    def visit(node):
-        if isinstance(node, dict):
-            for key, item in node.items():
-                lowered = str(key).lower()
-                if lowered in {"iserror", "is_error"} and item is True:
-                    failures.append(True)
-                elif lowered in {"exit_code", "exitcode", "returncode", "return_code"}:
-                    if isinstance(item, int) and not isinstance(item, bool):
-                        (successes if item == 0 else failures).append(True)
-                elif lowered in {"status", "outcome", "result"} and isinstance(item, str):
-                    status = item.strip().lower()
-                    if status in {"failed", "failure", "error", "timed_out", "timeout", "denied"}:
-                        failures.append(True)
-                    elif status in {"ok", "success", "succeeded", "completed", "passed"}:
-                        successes.append(True)
-                visit(item)
-        elif isinstance(node, list):
-            for item in node:
-                visit(item)
-
-    visit(value)
-    if failures:
-        return "failed"
-    if successes:
-        return "success"
-
-    try:
-        text = json.dumps(value, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        text = str(value)
-    match = re.search(r"(?:exit_code|exit code|returncode)[\"']?\s*[:=]?\s*(-?\d+)", text, re.I)
-    if match:
-        return "success" if int(match.group(1)) == 0 else "failed"
-    if re.search(r"\bprocess exited with code\s+[1-9]\d*\b", text, re.I):
-        return "failed"
-    if re.search(r"\b(?:permission denied|timed out|tool call failed)\b", text, re.I):
-        return "failed"
-    if "Done!" in text or re.search(r"\bprocess exited with code\s+0\b", text, re.I):
-        return "success"
-    return "unknown"
 
 
 def bash_command(payload):
@@ -573,6 +525,30 @@ def parse_marker(message):
     if not isinstance(marker, dict):
         return None, "completion marker must be a JSON object", digest(raw)
     return marker, None, digest(raw)
+
+
+def read_audit(state, facts, message):
+    if state.get("declaration_protocol") != "file":
+        return parse_marker(message)  # Compatibility for a hook already awaiting Stop during upgrade.
+    path = Path(state["audit_path"])
+    try:
+        with path.open("rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            raw = handle.read(MAX_MARKER_BYTES + 1)
+    except OSError:
+        return None, "local completion audit is missing", "missing"
+    if len(raw) > MAX_MARKER_BYTES:
+        return None, "local completion audit exceeds size limit", digest(raw)
+    latest_mutation = max([int(e.get("at_ns") or 0) for e in facts["mutations"]] or [0])
+    if metadata.st_mtime_ns < max(int(state.get("audit_not_before_ns") or 0), latest_mutation):
+        return None, "local completion audit is stale; submit after the latest input and changes", digest(raw)
+    try:
+        audit = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return None, "local completion audit is not valid JSON", digest(raw)
+    if not isinstance(audit, dict):
+        return None, "local completion audit must be a JSON object", digest(raw)
+    return audit, None, digest(raw)
 
 
 def nonempty_text(value, minimum=1):
@@ -712,29 +688,28 @@ def validate_disposition(marker, state, facts):
 
 
 def continuation_reason(state, errors, facts, attempt):
-    lines = [
-        "%s task=%s attempt=%d/%d]"
-        % (CONTINUATION_PREFIX, state["task_id"], attempt, MAX_BLOCKS),
-        "The execution task has not passed its completion audit:",
-    ]
-    for error in errors[:8]:
-        lines.append("- " + error)
-    if len(errors) > 8:
-        lines.append("- %d additional audit issue(s)" % (len(errors) - 8))
-    lines.append(
-        "Observed evidence: %d change event(s), %d verification event(s), %d fresh successful verification(s)."
-        % (
-            len(facts["observed_mutations"]),
-            len(facts["verifications"]),
-            len(facts["fresh_verifications"]),
-        )
-    )
-    lines.append(
-        "Re-read the complete user request and project instructions, continue the unfinished work, "
-        "run appropriate verification after the final change, and submit a corrected structured "
-        "completion marker. Do not respond with only a progress summary."
-    )
-    return "\n".join(lines)[:4000]
+    return "还有验收项需要处理，请继续完成并核验。"
+
+
+def save_audit_report(session_dir, state, errors, facts, attempt):
+    report = {
+        "task_id": state["task_id"], "attempt": attempt, "errors": errors,
+        "changes": len(facts["observed_mutations"]),
+        "verifications": len(facts["verifications"]),
+        "fresh_verifications": len(facts["fresh_verifications"]),
+    }
+    folder = session_dir / "audits" / state["task_id"]
+    atomic_write_json(folder / "latest.json", report)
+    atomic_write_json(folder / ("%d.json" % time.time_ns()), report)
+
+
+def continuation_context(session_dir, state):
+    try:
+        report = json.loads((session_dir / "audits" / state["task_id"] / "latest.json").read_text())
+        errors = report.get("errors", [])
+    except (OSError, ValueError):
+        errors = ["Read the active task audit and repeat the relevant final verification."]
+    return guard_context(state, "continuation") + "\nInternal audit findings: " + json.dumps(errors, ensure_ascii=False)
 
 
 def handle_user_prompt(payload, root):
@@ -749,6 +724,7 @@ def handle_user_prompt(payload, root):
             state = None
 
         if state:
+            ensure_file_protocol(state, session_dir)
             stop_state = state.get("stop") or {}
             expected_hash = stop_state.get("last_reason_hash")
             is_own_continuation = prompt_hash == expected_hash or (
@@ -757,9 +733,11 @@ def handle_user_prompt(payload, root):
             if is_own_continuation:
                 state["phase"] = "active"
                 write_state(state_path, state)
-                emit(additional_context("UserPromptSubmit", guard_context(state, "continuation")))
+                emit(additional_context("UserPromptSubmit", continuation_context(session_dir, state)))
                 return
 
+        if state:
+            state["audit_not_before_ns"] = time.time_ns()
         classification = classify_prompt(prompt, payload.get("permission_mode"))
         if classification == "cancel":
             if state:
@@ -821,6 +799,7 @@ def handle_user_prompt(payload, root):
                 "explicit_execution_prompt",
                 minimum_criteria(prompt),
             )
+            ensure_file_protocol(state, session_dir)
             write_state(state_path, state)
             emit(additional_context("UserPromptSubmit", guard_context(state, "execution request")))
             return
@@ -836,12 +815,18 @@ def handle_post_tool(payload, root):
     state_path = session_dir / "active.json"
     kind, label = classify_tool(payload)
     newly_armed = False
+    migrated = False
     with locked(session_dir):
         state = read_state(state_path)
+        if state and state.get("phase") in {"active", "suspended"}:
+            migrated = ensure_file_protocol(state, session_dir)
+            if migrated:
+                write_state(state_path, state)
         if state and state.get("phase") in {"active", "suspended"}:
             kind, label = refine_guarded_bash_kind(payload, kind, label)
         if state is None and kind == "mutation":
             state = new_state(payload, session_key, cwd_key, "mutation_observed", 2)
+            ensure_file_protocol(state, session_dir)
             write_state(state_path, state)
             newly_armed = True
         elif (
@@ -856,7 +841,7 @@ def handle_post_tool(payload, root):
     if state and state.get("phase") == "active" and kind != "guard":
         record_event(session_dir, state, payload, kind, label)
 
-    if newly_armed:
+    if newly_armed or migrated:
         emit(
             additional_context(
                 "PostToolUse",
@@ -889,9 +874,9 @@ def handle_stop(payload, root):
                 "last_reason_hash": None,
             },
         )
-        marker, marker_error, marker_hash = parse_marker(payload.get("last_assistant_message"))
         events = read_events(session_dir, state["task_id"])
         facts = evidence_summary(events)
+        marker, marker_error, marker_hash = read_audit(state, facts, payload.get("last_assistant_message"))
         if marker_error:
             disposition = "active"
             errors = [marker_error]
@@ -905,6 +890,7 @@ def handle_stop(payload, root):
             emit({})
             return
 
+        save_audit_report(session_dir, state, errors, facts, int(stop_state.get("block_count") or 0) + 1)
         event_signature = [
             (event.get("event_id"), event.get("kind"), event.get("outcome")) for event in events
         ]
@@ -972,9 +958,32 @@ def run_hook():
         fail_open("hook_runtime_error")
 
 
+def submit_audit(filename):
+    path = Path(filename).expanduser().absolute()
+    allowed = Path(tempfile.gettempdir()).resolve() / "codex-task-completion-guard"
+    resolved = path.resolve()
+    if allowed not in resolved.parents or not re.fullmatch(r"tcg_[0-9a-f]+\.json", path.name):
+        raise GuardError("invalid_audit_path")
+    raw = sys.stdin.buffer.read(MAX_MARKER_BYTES + 1)
+    if len(raw) > MAX_MARKER_BYTES:
+        raise GuardError("audit_too_large")
+    audit = json.loads(raw)
+    if not isinstance(audit, dict) or audit.get("task_id") != path.stem or audit.get("version") != SCHEMA_VERSION:
+        raise GuardError("invalid_audit_identity")
+    atomic_write_json(path, audit)
+    sys.stdout.write("Completion audit saved locally.\n")
+
+
 def main(argv):
+    if len(argv) == 4 and argv[1:3] == ["submit", "--audit-file"]:
+        try:
+            submit_audit(argv[3])
+        except (GuardError, OSError, ValueError, TypeError):
+            sys.stderr.write("Unable to save completion audit; check path and JSON.\n")
+            return 2
+        return 0
     if len(argv) != 2 or argv[1] != "hook":
-        sys.stderr.write("usage: completion_guard.py hook\n")
+        sys.stderr.write("usage: completion_guard.py hook | submit --audit-file PATH\n")
         return 2
     run_hook()
     return 0

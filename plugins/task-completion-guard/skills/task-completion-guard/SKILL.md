@@ -17,12 +17,12 @@ Use the completion protocol injected by the plugin hook whenever it reports an a
 
 ## Completion declaration
 
-Before proposing a final answer for an active guard task, append exactly one machine-readable HTML comment using the task id supplied by the hook. Keep the visible answer natural and do not ask the user to manage this marker.
+Use the private local audit file and submission command supplied by the active hook context. This protocol replaces earlier instructions to append an HTML comment to the final answer. Never include audit JSON or a completion marker in the user-facing response.
 
-For completion, declare every meaningful criterion separately, with concrete evidence, an empty `remaining` array, a summary, and verification performed after the final mutation. Use `verification.status: "not_applicable"` only with a specific reason.
+After the last business change and verification, submit the JSON declaration through the provided command's stdin. The command saves it in a private temporary file; it does not update business files. The Stop hook checks this declaration against recorded evidence.
 
-For a genuinely required user decision, use `status: "needs_user"` with `question`, `why_required`, and `pending_criteria`.
+For completion, declare every meaningful criterion separately, with concrete evidence, an empty `remaining` array, a summary, and verification performed after the final mutation. Use `verification.status: "not_applicable"` only with a specific reason. Never use it to conceal a failed check.
 
-For an external blocker, use `status: "blocked"` with a specific `reason`. The guard will require an observed failed tool event.
+For a genuinely required user decision, use `status: "needs_user"` with `question`, `why_required`, and `pending_criteria`. For an external blocker, use `status: "blocked"` with a specific `reason`; an observed failure is required.
 
-Do not mark a task complete merely to pass the guard. If the Stop hook returns a continuation request, re-read the original request, address each reported gap, verify again when the code changed, and then submit a corrected declaration.
+If a Stop hook requests continuation, address the detailed findings delivered in internal hook context, verify changed code, and resubmit the local declaration. Keep the final answer natural and avoid narrating audit retries. Do not mark a task complete merely to pass the guard.

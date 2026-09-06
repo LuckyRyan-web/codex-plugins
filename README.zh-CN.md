@@ -96,7 +96,9 @@ Implement this feature completely and verify the result.
 | `Stop` | 检查结构化完成声明；不符合条件时阻止提前结束。 |
 | `Interrupt` | 用户主动中断时暂停当前门禁。 |
 
-对于已经开启门禁的任务，Codex 必须声明：
+对于已经开启门禁的任务，Codex 通过 Hook 提供的命令，从标准输入提交 JSON
+声明。命令将声明写入私有本地审计文件；面向用户的回复不包含审计 JSON 或
+completion marker。声明应在最后一次业务修改和验证之后提交，内容包括：
 
 - 从完整需求提取出的有效验收项；
 - 每个验收项的状态和具体证据；
@@ -105,17 +107,26 @@ Implement this feature completely and verify the result.
 - 确实需要用户决定时，应说明明确问题和原因；
 - 确实存在外部阻塞时，应有已经观察到的失败或拒绝事件。
 
-如果审计失败，Stop Hook 会返回阻塞决定和缺失项，让 Codex 获得继续执行的
-机会。为了避免错误判断造成无限循环，最多阻止三次；连续没有可观察进展时也会
-降级为 fail-open。
+如果审计失败，Stop Hook 会阻止结束，并显示简短的续跑提示。详细诊断保存在
+本地，续跑时通过内部 Hook 上下文提供给 Codex。为了避免错误判断造成无限
+循环，最多阻止三次；连续没有可观察进展时也会降级为 fail-open。
 
 ### 数据和隐私
 
 Hook 只在本机执行，不向远程服务发送遥测或任务数据。
 
-状态保存在 Codex 提供的 `PLUGIN_DATA` 目录中。插件记录事件分类、时间、
-结果和 SHA-256 哈希；设计上不持久化原始提示词、工具输入或工具输出，也不解析
-不稳定的 Codex 会话 transcript 格式。
+任务状态、事件记录和审计诊断保存在
+`PLUGIN_DATA/completion-guard/v1/sessions/<session-hash>/` 下，内容包括任务
+元数据、审计文件路径、事件分类、时间、结果、SHA-256 哈希、诊断错误和验证
+计数。自动记录过程对提示词和工具数据保存哈希，不保留其原始内容；Hook 不解析
+Codex 会话 transcript 格式。
+
+提交的 JSON 声明单独保存在系统临时目录下的
+`codex-task-completion-guard/<session-hash>/<task-id>.json`，包含模型填写的
+验收项、证据描述、摘要以及需要用户回答的问题或阻塞原因，因此可能含有任务
+相关文本。在 POSIX 系统上，新建私有目录和 JSON 文件的权限分别为 `0700`
+和 `0600`。任务完成
+或中断时，插件不会自动删除这些记录和审计文件。
 
 安全模型和漏洞报告方式见 [SECURITY.md](SECURITY.md)。
 
