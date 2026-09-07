@@ -261,3 +261,17 @@ for release notes.
 ## License
 
 [MIT](LICENSE)
+
+### Required user decisions
+
+When the user requires a stage review, choice, approval, or authorization before
+continuing, the agent should submit `status: "needs_user"` and wait. Full-task
+completion checks and independent review are not prerequisites for that pause.
+An explicit current user-decision handoff in the final reply also enters
+`waiting_user`, even if the audit is missing or mistakenly says `complete`.
+
+Waiting does not mean completion. Repeated Stop events and old automatic hook
+continuations keep waiting; an actual user reply reopens processing without
+assuming that a follow-up question grants approval. Quotes, examples, conditions,
+and mere mentions of confirmation do not establish a current handoff. Unknown
+verification outcomes remain unknown, not successful.

@@ -4,6 +4,13 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
+### 修复
+
+- 需要用户确认的阶段优先进入 `waiting_user`，避免误填 `complete` 或未知验证
+  结果导致门禁反复催促继续；等待不等于验收通过。
+- 等待期间重复 Stop 与旧 Hook 续跑保持幂等，真实用户回复后才重新处理任务。
+- 完成上下文提供完整 `needs_user` 示例，明确等待状态无需先运行独立验收。
+
 ### 新增
 
 - 独立完成验收：`prepare-review` 保存私有要求、文件快照和 diff；主 Agent

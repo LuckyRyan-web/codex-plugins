@@ -54,7 +54,7 @@ class ReleasePackageTests(unittest.TestCase):
 
     def test_default_plugin_components_exist(self):
         self.assertTrue(HOOKS_PATH.is_file())
-        for module in ("completion_guard.py", "verification_output.py", "review_gate.py", "review_snapshot.py"):
+        for module in ("completion_guard.py", "verification_output.py", "review_gate.py", "review_snapshot.py", "user_wait.py"):
             self.assertTrue((PLUGIN_ROOT / "scripts" / module).is_file(), module)
         self.assertTrue(
             (PLUGIN_ROOT / "skills" / "task-completion-guard" / "SKILL.md").is_file()

@@ -1,6 +1,6 @@
 {
   "name": "task-completion-guard",
-  "version": "0.1.0+codex.20260906155550",
+  "version": "0.1.0+codex.20260907024250",
   "description": "Verify task completion with observed checks and a bounded independent review for consequential changes.",
   "author": {
     "name": "LuckyRyan-web",

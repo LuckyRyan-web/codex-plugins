@@ -4,8 +4,8 @@
 The hook deliberately separates semantic judgment from mechanical checks:
 Codex saves a structured completion audit in a private local file,
 while this script validates that declaration against observable tool events.
-It never parses the unstable Codex transcript format and never stores raw
-prompts, tool inputs, or tool outputs.
+It does not parse the unstable Codex transcript format. Tool events retain
+hashes; private independent-review handoffs retain the user requirements.
 """
 
 from __future__ import print_function
@@ -24,6 +24,7 @@ import xml.etree.ElementTree as ET
 
 from verification_output import response_outcome
 import review_gate
+from user_wait import waiting_for_user, clarification_only
 from review_snapshot import SnapshotError
 import time
 
@@ -394,16 +395,25 @@ def guard_context(state, activation_note=None):
         "Task Completion Guard is ACTIVE for task %s.%s\n"
         "This local-file declaration protocol supersedes earlier inline/HTML marker instructions. "
         "Never append an audit marker or audit JSON to the user-facing answer.\n"
+        "If a required user confirmation, choice, authorization or stage approval is pending, "
+        "pause and submit status=needs_user with a concrete question, why_required and pending_criteria. "
+        "Do not submit complete for a stage that is waiting for the user's decision. "
+        "Completion-only checks and independent review are not prerequisites for this waiting state. "
         "Finish the entire authorized task, derive at least %d meaningful acceptance criteria, "
         "and verify the final changes. Save the audit after all business changes and verification. "
         "Send this JSON schema to the following command's stdin (replace placeholders with evidence):\n%s\n%s\n"
+        "For a required user decision use this alternative JSON instead:\n%s\n"
         "The command writes only a private temporary audit file. Do not write to plugin state or event logs. "
         "Use status=needs_user with question, why_required and pending_criteria only for a required user decision; "
         "use status=blocked with reason only for an observed external blocker. "
         "Do not fabricate evidence or bypass failed checks. "
         "Keep the final answer natural and do not narrate audit retries."
         % (state["task_id"], note, state["minimum_criteria"], command,
-           json.dumps(audit_example(state), ensure_ascii=False))
+           json.dumps(audit_example(state), ensure_ascii=False),
+           json.dumps({"version": 1, "task_id": state["task_id"], "status": "needs_user",
+                       "question": "the specific choice or stage approval needed from the user",
+                       "why_required": "why the next authorized step depends on that decision",
+                       "pending_criteria": ["the criterion that must wait for the user"]}, ensure_ascii=False))
     ) + review_gate.context(state)
 
 
@@ -745,6 +755,11 @@ def handle_user_prompt(payload, root):
                 continuation_text.startswith(CONTINUATION_PREFIX) and state.get("task_id") in continuation_text
             )
             if is_own_continuation:
+                if state.get("phase") == "waiting_user":
+                    emit(additional_context("UserPromptSubmit",
+                        "The task is waiting for a user decision. This is an automatic hook message, "
+                        "not a user reply or approval. Keep waiting; do not continue work or run another review."))
+                    return
                 state["phase"] = "active"
                 write_state(state_path, state)
                 emit(additional_context("UserPromptSubmit", continuation_context(session_dir, state)))
@@ -761,6 +776,15 @@ def handle_user_prompt(payload, root):
             emit({})
             return
 
+        if (state and state.get("phase") == "waiting_user"
+                and (classification == "exempt"
+                     or (classification != "enforce" and clarification_only(prompt)))):
+            write_state(state_path, state)
+            emit(additional_context("UserPromptSubmit",
+                "The user requested explanation or read-only work, not approval to continue. "
+                "Answer that request while retaining the pending user-decision checkpoint."))
+            return
+
         if classification == "exempt" and state and state.get("phase") in {"active", "suspended"}:
             state["phase"] = "suspended"
             write_state(state_path, state)
@@ -769,6 +793,7 @@ def handle_user_prompt(payload, root):
 
         if state and state.get("phase") == "waiting_user":
             state["phase"] = "active"
+            state.pop("user_wait", None)
             state["stop"] = {
                 "block_count": 0,
                 "stalled_count": 0,
@@ -776,7 +801,7 @@ def handle_user_prompt(payload, root):
                 "last_reason_hash": None,
             }
             write_state(state_path, state)
-            emit(additional_context("UserPromptSubmit", guard_context(state, "user response received")))
+            emit(additional_context("UserPromptSubmit", guard_context(state, "user response received; address the reply without assuming approval of the pending step")))
             return
 
         if state and state.get("phase") in {"active", "suspended"} and RESUME_RE.match(prompt.strip()):
@@ -895,7 +920,21 @@ def handle_stop(payload, root):
         except CorruptState:
             fail_open("state_corrupt")
             return
-        if state is None or state.get("phase") in TERMINAL_PHASES | {"suspended", "degraded"}:
+        if state is None or state.get("phase") in TERMINAL_PHASES | {"suspended", "degraded", "waiting_user"}:
+            emit({})
+            return
+
+        # Pausing for a human decision is a different outcome from completing
+        # the work. The visible handoff wins over an accidentally submitted
+        # complete audit, including its missing/stale verification evidence.
+        if waiting_for_user(payload.get("last_assistant_message")):
+            state["phase"] = "waiting_user"
+            state["user_wait"] = {
+                "source": "assistant_final",
+                "message_hash": digest(payload["last_assistant_message"]),
+                "at_ns": time.time_ns(),
+            }
+            write_state(state_path, state)
             emit({})
             return
 

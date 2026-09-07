@@ -460,7 +460,8 @@ def context(state):
     cmd = "python3 %s prepare-review --audit-file %s" % (
         shlex.quote(str(script)), shlex.quote(state["audit_path"]))
     return (
-        "\nBefore completion, run this local command with JSON on stdin:\n%s\n"
+        "\nOnly when declaring status=complete (not while waiting for user confirmation), "
+        "run this local command with JSON on stdin:\n%s\n"
         '{"requirements":["full requirement including user clarifications"],'
         '"paths":["relative/path/to/changed-file"],"risk":"auto",'
         '"verification_evidence":["actual command, result and evidence path"]}\n'
