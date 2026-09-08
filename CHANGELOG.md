@@ -24,6 +24,8 @@ All notable changes to this repository are documented here.
 - `waived` 验收项需要具体 `reason` 与支持它的 `evidence`，不能只给一个标签。
 - `prepare-review` 机械核对用户自己列出的编号/项目符号条数，`requirements`
   少于该条数时拒绝准备，避免验收项在转述中缩水。
+- `routine` 标签只能为纯文案改动免除独立验收：改动一旦含代码或配置文件，
+  无论多小都回落到默认规则，作者不能自行发放免检。
 
 ### 新增
 

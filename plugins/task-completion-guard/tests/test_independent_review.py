@@ -313,11 +313,22 @@ class IndependentReviewTests(unittest.TestCase):
         self.prepare(risk="auto")
         self.assert_blocked(self.stop())
 
-    def test_small_explicit_routine_change_may_complete_without_reviewer(self):
+    def test_small_explicit_routine_prose_change_may_complete_without_reviewer(self):
+        self.start("请修改说明文字")
+        self.edit("README.md", "# Calculator\n\nRun it with a number.\n")
+        self.verify()
+        self.prepare(risk="routine", paths=["README.md"])
+        self.assertEqual(self.stop(), {})
+        self.assertEqual(self.state()["phase"], "completed")
+
+    def test_routine_cannot_waive_review_for_a_code_change(self):
         self.start()
         self.edit()
         self.verify()
-        self.prepare(risk="routine")
+        request, _ = self.prepare(risk="routine")
+        self.assertTrue(self.prepared[request["review_run_id"]]["review_required"])
+        self.assert_blocked(self.stop())
+        self.finish_review(request)
         self.assertEqual(self.stop(), {})
         self.assertEqual(self.state()["phase"], "completed")
 

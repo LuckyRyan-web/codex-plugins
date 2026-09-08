@@ -123,7 +123,11 @@ def policy(snapshot, risk):
     if risk == "important" or snapshot["critical"]:
         return True
     if risk == "routine":
-        return not (snapshot["file_count"] <= 1 and snapshot["changed_lines"] <= 20)
+        # An author-chosen label may waive review only for prose. Any changed
+        # code or configuration file falls back to the size-independent rule,
+        # so a small edit cannot exempt itself from an independent reader.
+        return not (snapshot["file_count"] <= 1 and snapshot["changed_lines"] <= 20
+                    and not snapshot["code_file_count"])
     return bool(snapshot["code_file_count"] or snapshot["file_count"] > 2
                 or snapshot["changed_lines"] > 80)
 
