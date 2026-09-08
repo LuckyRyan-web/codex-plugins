@@ -16,6 +16,15 @@ All notable changes to this repository are documented here.
 - 出现上述失败时，Stop 推回改为“独立验收无法完成，请修复后重试，或用
   blocked 状态说明具体原因”，替代无差别的通用提示。
 
+### 调整（完成门槛）
+
+- `git diff --check` 不再计入验证：它只扫描空白字符与冲突标记，不构成改动
+  可用的证据。
+- 改动包含代码或配置文件时不再接受 `verification.status: "not_applicable"`。
+- `waived` 验收项需要具体 `reason` 与支持它的 `evidence`，不能只给一个标签。
+- `prepare-review` 机械核对用户自己列出的编号/项目符号条数，`requirements`
+  少于该条数时拒绝准备，避免验收项在转述中缩水。
+
 ### 新增
 
 - 独立完成验收：`prepare-review` 保存私有要求、文件快照和 diff；主 Agent

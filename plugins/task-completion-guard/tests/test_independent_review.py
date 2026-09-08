@@ -566,6 +566,44 @@ class IndependentReviewTests(unittest.TestCase):
         self.assert_blocked(self.blocked_stop("主 Agent 自行认领后声称受阻。"))
         self.assertIn("blocked requires an observed failed or denied tool event", self.audit_errors())
 
+    def test_not_applicable_verification_cannot_cover_a_code_change(self):
+        self.start()
+        self.edit()
+        self.verify()
+        request, _ = self.prepare()
+        self.finish_review(request)
+        blocked = self.stop(verification={
+            "status": "not_applicable",
+            "reason": "This change is behavioral and needs no executable check",
+        })
+        self.assert_blocked(blocked)
+        self.assertIn(
+            "not_applicable verification cannot cover a changed code or configuration file",
+            self.audit_errors(),
+        )
+
+    def test_prepare_requires_coverage_of_enumerated_user_items(self):
+        self.start(prompt="请帮我修改 calculate：\n1. 修正返回值\n2. 补一个单元测试\n3. 更新 README")
+        self.edit()
+        self.verify()
+        args = ["prepare-review", "--audit-file", str(self.audit_path)]
+        refused = self.command(args, {
+            "requirements": ["Return the corrected calculation for the requested input"],
+            "paths": ["app.py"], "risk": "auto",
+        })
+        self.assertEqual(refused.returncode, 2, refused.stdout)
+        self.assertIn("3 enumerated items", refused.stderr)
+
+        accepted = self.command(args, {
+            "requirements": [
+                "Return the corrected calculation for the requested input",
+                "Add a unit test covering the corrected calculation",
+                "Update README with the corrected behavior",
+            ],
+            "paths": ["app.py"], "risk": "auto",
+        })
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
     def test_claimed_reviewer_cannot_modify_files(self):
         self.start()
         self.edit()

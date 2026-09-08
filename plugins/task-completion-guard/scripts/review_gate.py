@@ -24,6 +24,9 @@ READ_COMMAND = re.compile(
     r"^\s*(?:(?:cat|rg|grep|head|tail|wc|stat|file|ls|pwd)\b|"
     r"git\s+(?:diff|show|status|ls-files|log|rev-parse)\b)[^;&|<>$\x60]*$")
 REVIEW_PREFIX = "[completion-review:"
+ENUMERATION_RE = re.compile(
+    r"^[ \t]*(?:[-*\u2022\u00b7]|\(?\d{1,2}[.)\u3001]|[\uff08(]\d{1,2}[)\uff09]|"
+    r"\u7b2c[\u4e00-\u5341]+[\u3001.)\uff09])[ \t]*\S", re.M)
 
 
 class ReviewError(ValueError):
@@ -97,6 +100,25 @@ def add_user_context(state, prompt):
     write_json(path, {"user_requests": requests})
 
 
+def enumerated_items(user_requests):
+    """Count the list items the user wrote across their own requests.
+
+    A numbered or bulleted request is the one place where the caller stated
+    the size of the job themselves, so it is a usable floor for how many
+    acceptance requirements the author must carry into the review.
+    """
+    return sum(len(ENUMERATION_RE.findall(text)) for text in user_requests
+               if isinstance(text, str))
+
+
+def code_change_observed(state):
+    """True when the reviewed snapshot holds a changed code or config file."""
+    current = current_review(state)
+    if not current:
+        return False
+    return bool((current.get("snapshot") or {}).get("code_file_count"))
+
+
 def policy(snapshot, risk):
     if risk == "important" or snapshot["critical"]:
         return True
@@ -166,6 +188,12 @@ def prepare(audit_file, data, cwd):
     except FileNotFoundError:
         user_requests = []
     items = [{"id": "R%d" % (i + 1), "description": value} for i, value in enumerate(requirements)]
+    listed = min(enumerated_items(user_requests), 20)
+    if listed >= 2 and len(items) < listed:
+        raise ReviewError(
+            "the user listed %d enumerated items but only %d requirements were "
+            "supplied; carry every listed item into its own requirement"
+            % (listed, len(items)))
     req_digest = digest({"requirements": items, "user_requests": user_requests,
                          "verification_evidence": evidence, "risk": risk})
     snapshot = capture_snapshot(cwd, data.get("paths"))

@@ -335,6 +335,50 @@ class CompletionGuardTests(unittest.TestCase):
         )
         self.assertEqual(allowed, {})
 
+    def test_whitespace_scan_alone_is_not_a_verification(self):
+        task_id, _ = self.start_task()
+        self.use_legacy_active_task()
+        self.post_patch()
+        self.run_hook(
+            "PostToolUse",
+            tool_name="Bash",
+            tool_use_id="whitespace-1",
+            tool_input={"command": "git diff --check"},
+            tool_response={"exit_code": 0, "output": "process exited with code 0"},
+        )
+        output, _ = self.run_hook(
+            "Stop", last_assistant_message=self.complete_marker(task_id, count=1),
+        )
+        self.assertEqual(output["decision"], "block")
+        self.assertIn("no successful verification was observed", self.audit_errors())
+
+    def test_waived_criterion_needs_evidence_and_a_specific_reason(self):
+        task_id, _ = self.start_task("请修改这个配置")
+        self.use_legacy_active_task()
+        self.post_patch()
+        self.post_verification()
+        thin = [{
+            "id": "C1", "description": "acceptance item 1",
+            "status": "waived", "reason": "不需要",
+        }]
+        output, _ = self.run_hook(
+            "Stop", last_assistant_message=self.complete_marker(task_id, criteria=thin),
+        )
+        self.assertEqual(output["decision"], "block")
+        errors = self.audit_errors()
+        self.assertIn("needs a specific waiver reason", errors)
+        self.assertIn("needs the observation supporting the waiver", errors)
+
+        supported = [{
+            "id": "C1", "description": "acceptance item 1", "status": "waived",
+            "reason": "用户在后续消息里明确取消了这一项，不再需要迁移旧数据",
+            "evidence": "第 2 条用户消息：这块先不用做",
+        }]
+        allowed, _ = self.run_hook(
+            "Stop", last_assistant_message=self.complete_marker(task_id, criteria=supported),
+        )
+        self.assertEqual(allowed, {})
+
     def test_not_applicable_verification_requires_reason_but_can_pass(self):
         task_id, _ = self.start_task("请修改这个配置")
         self.use_legacy_active_task()

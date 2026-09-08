@@ -133,7 +133,6 @@ VERIFICATION_PATTERNS = [
     ("lint", re.compile(r"\b(?:pnpm|npm|yarn|bun)\b[^\n;|&]*\blint\b", re.I)),
     ("typecheck", re.compile(r"\btype[-:]?check\b|\btsc\b[^\n;|&]*--noEmit\b", re.I)),
     ("build", re.compile(r"\b(?:pnpm|npm|yarn|bun)\b[^\n;|&]*\bbuild\b", re.I)),
-    ("git diff --check", re.compile(r"\bgit\s+diff\s+--check\b", re.I)),
     ("make check", re.compile(r"\bmake\s+(?:test|check|verify|lint)\b", re.I)),
     ("gradle test", re.compile(r"\b(?:gradle|gradlew)\b[^\n;|&]*\btest\b", re.I)),
     ("maven test", re.compile(r"\bmvn\b[^\n;|&]*\b(?:test|verify)\b", re.I)),
@@ -635,8 +634,11 @@ def validate_complete(marker, state, facts):
             errors.append(prefix + " is not done or explicitly waived")
         elif status == "done" and not nonempty_text(criterion.get("evidence"), 3):
             errors.append(prefix + " needs concrete evidence")
-        elif status == "waived" and not nonempty_text(criterion.get("reason"), 6):
-            errors.append(prefix + " needs a specific waiver reason")
+        elif status == "waived":
+            if not nonempty_text(criterion.get("reason"), 12):
+                errors.append(prefix + " needs a specific waiver reason")
+            if not nonempty_text(criterion.get("evidence"), 3):
+                errors.append(prefix + " needs the observation supporting the waiver")
 
     remaining = marker.get("remaining")
     if not isinstance(remaining, list) or remaining:
@@ -659,6 +661,10 @@ def validate_complete(marker, state, facts):
         elif status == "not_applicable":
             if not nonempty_text(verification.get("reason"), 6):
                 errors.append("not_applicable verification needs a specific reason")
+            if review_gate.code_change_observed(state):
+                errors.append(
+                    "not_applicable verification cannot cover a changed code or configuration file"
+                )
         else:
             errors.append("verification.status must be passed or not_applicable")
 
