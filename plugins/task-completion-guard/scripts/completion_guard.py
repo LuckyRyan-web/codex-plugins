@@ -778,10 +778,13 @@ def handle_user_prompt(payload, root):
                 emit(additional_context("UserPromptSubmit", continuation_context(session_dir, state)))
                 return
 
-        if state:
+        classification = classify_prompt(prompt, payload.get("permission_mode"))
+        asks_only = classification != "enforce" and clarification_only(prompt)
+        if state and not asks_only:
+            # A question about the work states no new requirement, so it must
+            # not stale a submitted declaration or a prepared review scope.
             state["audit_not_before_ns"] = time.time_ns()
             review_gate.add_user_context(state, prompt)
-        classification = classify_prompt(prompt, payload.get("permission_mode"))
         if classification == "cancel":
             if state:
                 state["phase"] = "cancelled"
@@ -790,8 +793,7 @@ def handle_user_prompt(payload, root):
             return
 
         if (state and state.get("phase") == "waiting_user"
-                and (classification == "exempt"
-                     or (classification != "enforce" and clarification_only(prompt)))):
+                and (classification == "exempt" or asks_only)):
             write_state(state_path, state)
             emit(additional_context("UserPromptSubmit",
                 "The user requested explanation or read-only work, not approval to continue. "
@@ -827,6 +829,15 @@ def handle_user_prompt(payload, root):
             }
             write_state(state_path, state)
             emit(additional_context("UserPromptSubmit", guard_context(state, "task resumed")))
+            return
+
+        if state and state.get("phase") == "active" and asks_only:
+            state["answer_only_turn"] = True
+            write_state(state_path, state)
+            emit(additional_context("UserPromptSubmit",
+                "The user asked about the work, not for more work. Answer the question. "
+                "The task, its acceptance items and any submitted declaration are unchanged, "
+                "and this answering turn does not need a new completion audit."))
             return
 
         if state and state.get("phase") == "active":
@@ -912,6 +923,15 @@ def handle_post_tool(payload, root):
 
     if state and state.get("phase") == "active" and kind != "guard":
         record_event(session_dir, state, payload, kind, label)
+        if kind in {"mutation", "possible_mutation"} and state.get("answer_only_turn"):
+            # Real work started during the answering turn, so judge it normally.
+            with locked(session_dir):
+                try:
+                    current = read_state(state_path)
+                except CorruptState:
+                    current = None
+                if current and current.pop("answer_only_turn", None):
+                    write_state(state_path, current)
 
     if newly_armed or migrated:
         emit(
@@ -947,6 +967,13 @@ def handle_stop(payload, root):
                 "message_hash": digest(payload["last_assistant_message"]),
                 "at_ns": time.time_ns(),
             }
+            write_state(state_path, state)
+            emit({})
+            return
+
+        if state.pop("answer_only_turn", None):
+            # The user asked a question and this turn answered it. Judge the
+            # task itself on the next stop that follows real work.
             write_state(state_path, state)
             emit({})
             return

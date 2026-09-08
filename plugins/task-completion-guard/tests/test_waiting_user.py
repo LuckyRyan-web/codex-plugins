@@ -5,10 +5,18 @@ discovery does not inherit or run that module's test cases a second time.
 Lifecycle state is observed through hook subprocesses, never fabricated here.
 """
 
+import importlib.util
 import json
+from pathlib import Path
 import unittest
 
 import test_independent_review as independent
+
+_MODULE = Path(__file__).resolve().parents[1] / "scripts" / "user_wait.py"
+_SPEC = importlib.util.spec_from_file_location("user_wait", _MODULE)
+_USER_WAIT = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_USER_WAIT)
+clarification_only = _USER_WAIT.clarification_only
 
 
 WAITING_MESSAGE = "我停在第一阶段，等待你对造型的确认。"
@@ -320,6 +328,85 @@ class WaitingUserTests(unittest.TestCase):
         self.assertEqual(self.state()["phase"], "active")
         self.assertEqual(self.state()["task_id"], before["task_id"])
         self.assertGreater(self.state()["audit_not_before_ns"], before["audit_not_before_ns"])
+
+
+    def test_colloquial_question_without_a_question_mark_preserves_waiting(self):
+        # Chinese questions routinely put the interrogative mid-sentence and
+        # drop the mark; those used to re-arm the task and stale its audit.
+        self.start("请修改造型")
+        self.needs_user_audit()
+        self.assert_waiting(self.stop_message("下一阶段采用圆形造型还是方形造型？"))
+        before = self.state()
+        self.hook("UserPromptSubmit", prompt="你怎么知道我的项目路径的")
+        self.assertEqual(self.state()["phase"], "waiting_user")
+        self.assertEqual(self.state()["audit_not_before_ns"], before["audit_not_before_ns"])
+        self.assert_waiting(self.stop_message("这个路径是你在对话里给我的，Skill 没有存它。"))
+
+    def test_polite_request_shaped_as_a_question_still_resumes_the_task(self):
+        self.start("请修改造型")
+        self.needs_user_audit()
+        self.assert_waiting(self.stop_message("下一阶段采用圆形造型还是方形造型？"))
+        before = self.state()
+        self.hook("UserPromptSubmit", prompt="能不能改成方形造型")
+        self.assertEqual(self.state()["phase"], "active")
+        self.assertGreater(self.state()["audit_not_before_ns"], before["audit_not_before_ns"])
+
+    def test_question_during_active_work_is_answered_without_a_pushback(self):
+        self.start("请修改造型")
+        self.assert_still_guarded(self.stop_message("第一阶段还在进行中。"))
+        before = self.state()
+        self.hook("UserPromptSubmit", prompt="你怎么知道要改这个文件的")
+        self.assertTrue(self.state()["answer_only_turn"])
+        self.assertEqual(self.state()["audit_not_before_ns"], before["audit_not_before_ns"])
+        self.assertEqual(self.stop_message("是你在上一条消息里指定的这个文件。"), {})
+        self.assertNotIn("answer_only_turn", self.state())
+        self.assert_still_guarded(self.stop_message("继续处理中。"))
+
+    def test_work_during_an_answering_turn_is_judged_normally(self):
+        self.start("请修改造型")
+        self.assert_still_guarded(self.stop_message("第一阶段还在进行中。"))
+        self.hook("UserPromptSubmit", prompt="你怎么知道要改这个文件的")
+        self.assertTrue(self.state()["answer_only_turn"])
+        self.edit()
+        self.assertNotIn("answer_only_turn", self.state())
+        self.assert_still_guarded(self.stop_message("顺手改完了。"))
+
+
+class ClarificationPhrasingTests(unittest.TestCase):
+    """The interrogative may sit mid-sentence with no question mark at all."""
+
+    QUESTIONS = (
+        "你怎么知道我的项目路径的",
+        "这个路径是 Skill 自动知道的吗",
+        "是不是安装的时候就写死了",
+        "这个 Skill 有没有把路径存起来",
+        "那我换个对话还能用吗",
+        "路径是从哪里来的？",
+        "为什么会知道这个地址",
+        "解释一下这个是怎么回事",
+        "did you hardcode the path",
+        "is the path stored in the skill",
+    )
+    REQUESTS = (
+        "能不能改成 3000 端口",
+        "帮我把端口改成 3000",
+        "可以改成 3000 吗",
+        "麻烦重启一下服务",
+        "是否可以帮我部署一下",
+        "can you change the port to 3000",
+        "确认通过，继续下一阶段",
+        "再补一个测试",
+    )
+
+    def test_colloquial_questions_are_clarifications(self):
+        for prompt in self.QUESTIONS:
+            with self.subTest(prompt=prompt):
+                self.assertTrue(clarification_only(prompt))
+
+    def test_requests_are_not_clarifications(self):
+        for prompt in self.REQUESTS:
+            with self.subTest(prompt=prompt):
+                self.assertFalse(clarification_only(prompt))
 
 
 if __name__ == "__main__":

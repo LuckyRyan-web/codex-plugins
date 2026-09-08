@@ -77,12 +77,42 @@ def continuing_now(text):
     return False
 
 
+_ACTION_ZH = (
+    "实现|开发|新增|添加|增加|修复|修改|改成|改为|改一下|改掉|重构|迁移|升级|降级|"
+    "删除|移除|接入|集成|部署|发布|配置|安装|创建|生成|编写|完善|补充|优化|替换|"
+    "落地|处理|解决|搞定|运行|执行|重启|回滚|提交|推送"
+)
+# A modal in front of an action verb is a polite request, not a question, even
+# when it ends in a question mark: "能不能改成 3000" asks for work.
+_REQUEST_ZH = re.compile(
+    r"(?:能不能|能否|可不可以|可以|麻烦|帮我|给我|请|要不要)[^。！？!?\n]{0,12}(?:"
+    + _ACTION_ZH + r")")
+_REQUEST_EN = re.compile(
+    r"\b(?:can|could|would|will|please|possible)\b[^.?!\n]{0,24}"
+    r"\b(?:add|change|fix|update|implement|remove|delete|run|deploy|install|"
+    r"write|make|refactor|revert|commit|push)\b", re.I)
+# Chinese questions routinely put the interrogative mid-sentence and drop the
+# question mark, so anchoring on the first word or a trailing "?" misses most
+# of them.
+_QUESTION_ZH = re.compile(
+    r"^(?:为什么|为何|什么|哪里|哪种|哪一|哪个|怎样|如何|怎么|能否解释|可以解释|"
+    r"能解释|解释一下|什么时候)"
+    r"|(?:是不是|是否|有没有|对不对|是吗|怎么知道|怎么会|为什么|为何|从哪|哪来|多少)"
+    r"|[吗呢]\s*[。.!！]?$"
+    r"|[?？]\s*$")
+_QUESTION_EN = re.compile(
+    r"^(?:why|what|how|where|when|which|who|did|do|does|is|are|was|were|"
+    r"can you explain|could you explain)\b|[?]\s*$", re.I)
+
+
 def clarification_only(prompt):
     """A question while parked asks for information, not implicit approval."""
     if not isinstance(prompt, str):
         return False
     text = prompt.strip()
-    return bool(re.search(r"^(?:为什么|为何|什么|哪里|哪种|哪一|怎样|如何|怎么|能否解释|可以解释|能解释|解释一下|什么时候)|[?？]$|^(?:why|what|how|where|when|can you explain|could you explain)\b", text, re.I))
+    if not text or _REQUEST_ZH.search(text) or _REQUEST_EN.search(text):
+        return False
+    return bool(_QUESTION_ZH.search(text) or _QUESTION_EN.search(text))
 
 
 def waiting_for_user(message):
