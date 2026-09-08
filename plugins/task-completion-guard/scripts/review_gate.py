@@ -345,7 +345,13 @@ def after_tool(state, payload):
             current["claim_tool_use_id"] = payload.get("tool_use_id")
             current["isolation_evidence"] = "observed no-history spawn and fresh host child challenge"
         else:
-            raise ReviewError("review claim lacks a fresh host child identity and matching isolated spawn")
+            detail = "review claim lacks a fresh host child identity and matching isolated spawn"
+            # A child that claimed without a bindable host identity can never
+            # produce a collectable report for this snapshot. Remember that so
+            # completion can report an external blocker instead of retrying.
+            if child and not current.get("agent_id"):
+                current["claim_error"] = detail
+            raise ReviewError(detail)
         return True
     return register_preparation(state, payload)
 
@@ -416,6 +422,29 @@ def subagent_stop(state, payload, session_dir):
     except (OSError, ValueError, SnapshotError) as exc:
         current["verdict"] = "inconclusive"
         current["report_error"] = str(exc)
+
+
+def blocking_failure(state):
+    """Name a review failure the main agent cannot clear by trying again.
+
+    Preparation and requirement mismatches are excluded: those are resolved by
+    preparing the current code again. Only a reviewer that can never start,
+    never bind a host identity, or has spent its attempts leaves the task
+    genuinely blocked on tooling rather than on unfinished work.
+    """
+    review = state.get("review")
+    if not review:
+        return None
+    current = current_review(state)
+    if current and current.get("review_required") and current.get("spawned"):
+        if not current.get("spawn_acknowledged") and current.get("report_error"):
+            return "independent reviewer could not be started"
+        if current.get("claim_error") and not current.get("agent_id"):
+            return "independent reviewer never bound a host identity"
+    if len(review.get("attempts") or []) >= MAX_REVIEWS and (
+            not current or current.get("verdict") != "passed"):
+        return "independent review reached its attempt limit without a pass"
+    return None
 
 
 def completion_errors(state):

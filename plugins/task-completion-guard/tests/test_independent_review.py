@@ -227,6 +227,25 @@ class IndependentReviewTests(unittest.TestCase):
         self.submit(**patch)
         return self.hook("Stop", last_assistant_message="已修复，验证通过。")
 
+    def blocked_stop(self, reason="独立验收子 Agent 无法启动，无法取得有效结论。"):
+        return self.stop(status="blocked", reason=reason)
+
+    def failed_spawn(self, request, response):
+        tool_use_id = "spawn-fail-%d" % self.event_number
+        self.tool(
+            "collaborationspawn_agent", self.review_input(request), {},
+            event="PreToolUse", tool_use_id=tool_use_id,
+        )
+        return self.tool(
+            "collaborationspawn_agent", self.review_input(request), response,
+            tool_use_id=tool_use_id,
+        )
+
+    def audit_errors(self):
+        path = list(self.data.rglob("audits/%s/latest.json" % self.task_id))
+        self.assertEqual(len(path), 1, path)
+        return json.loads(path[0].read_text())["errors"]
+
     def assert_blocked(self, output):
         self.assertEqual(output.get("decision"), "block", output)
         self.assertNotEqual(self.state()["phase"], "completed")
@@ -487,6 +506,65 @@ class IndependentReviewTests(unittest.TestCase):
         self.claim(request, agent_id=agent_id)
         self.finish_review(request, agent_id=agent_id)
         self.assert_blocked(self.stop())
+
+    def test_unstartable_reviewer_can_be_declared_an_external_blocker(self):
+        self.start()
+        self.edit()
+        self.verify()
+        request, _ = self.prepare()
+        self.failed_spawn(request, {"isError": True, "error": "Independent agent capability unavailable"})
+        refused = self.stop()
+        self.assert_blocked(refused)
+        self.assertIn("独立验收无法完成", refused["reason"])
+        self.assertLess(len(refused["reason"]), 80)
+        self.assertEqual(self.blocked_stop(), {})
+        self.assertEqual(self.state()["phase"], "blocked_external")
+
+    def test_unbound_reviewer_identity_can_be_declared_an_external_blocker(self):
+        self.start()
+        self.edit()
+        self.verify()
+        request, _ = self.prepare()
+        agent_id = self.spawn(request, start=False)
+        self.claim(request, agent_id=agent_id)
+        self.assert_blocked(self.stop())
+        self.assertEqual(self.blocked_stop("独立验收身份绑定失败，未能取得认证通过状态。"), {})
+        self.assertEqual(self.state()["phase"], "blocked_external")
+
+    def test_exhausted_review_attempts_can_be_declared_an_external_blocker(self):
+        self.start()
+        self.edit()
+        self.verify()
+        first, _ = self.prepare()
+        self.finish_review(first, verdict="inconclusive", findings=["No runnable evidence was readable"])
+        self.edit(content="def calculate(value):\n    return value + 3\n")
+        self.verify()
+        second, _ = self.prepare()
+        self.finish_review(second, verdict="inconclusive", findings=["No runnable evidence was readable"])
+        self.assert_blocked(self.stop())
+        self.assertEqual(self.blocked_stop("两次独立验收均无法取得有效结论。"), {})
+        self.assertEqual(self.state()["phase"], "blocked_external")
+
+    def test_a_running_reviewer_does_not_license_a_blocked_disposition(self):
+        self.start()
+        self.edit()
+        self.verify()
+        request, _ = self.prepare()
+        self.spawn(request)
+        refused = self.blocked_stop("独立验收还没有返回结论。")
+        self.assert_blocked(refused)
+        self.assertIn("还有验收项", refused["reason"])
+        self.assertIn("blocked requires an observed failed or denied tool event", self.audit_errors())
+
+    def test_main_agent_claim_does_not_license_a_blocked_disposition(self):
+        self.start()
+        self.edit()
+        self.verify()
+        request, _ = self.prepare()
+        self.spawn(request, start=False)
+        self.claim(request)
+        self.assert_blocked(self.blocked_stop("主 Agent 自行认领后声称受阻。"))
+        self.assertIn("blocked requires an observed failed or denied tool event", self.audit_errors())
 
     def test_claimed_reviewer_cannot_modify_files(self):
         self.start()

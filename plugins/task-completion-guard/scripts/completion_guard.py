@@ -694,7 +694,10 @@ def validate_disposition(marker, state, facts):
     if status == "blocked":
         if not nonempty_text(marker.get("reason"), 8):
             errors.append("blocked requires a specific reason")
-        if not facts["failures"]:
+        # A review pipeline that cannot start or conclude is itself an observed
+        # blocker. Its tool events are consumed by the review gate before they
+        # reach the event log, so ask the gate directly instead.
+        if not facts["failures"] and not review_gate.blocking_failure(state):
             errors.append("blocked requires an observed failed or denied tool event")
         return "blocked_external", errors
     errors.append("status must be complete, needs_user, or blocked")
@@ -702,6 +705,10 @@ def validate_disposition(marker, state, facts):
 
 
 def continuation_reason(state, errors, facts, attempt):
+    # The reason is user-facing, so it stays short; the full audit findings
+    # reach the model through continuation_context on the next prompt.
+    if review_gate.blocking_failure(state):
+        return "独立验收无法完成，请修复后重试，或用 blocked 状态说明具体原因。"
     return "还有验收项需要处理，请继续完成并核验。"
 
 
