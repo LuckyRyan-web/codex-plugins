@@ -71,9 +71,9 @@ diff 和摘要，本身不调用模型。
 
 `review_required: false` 时无需子 Agent，但仍须提交完成审计。否则：
 
-1. 将返回的 `spawn` 字段原样传给原生 `spawn_agent`，保留精确 `message` 和
-   `fork_turns: "none"`。不复制编码历史，不创建用户可见的新任务，不添加模型
-   覆盖参数；使用当前模型。
+1. 将返回的 `spawn` 字段原样传给原生 `spawn_agent`，保留精确 `task_name`、
+   `message` 和 `fork_turns: "none"`。不复制编码历史，不创建用户可见的新
+   任务，不添加模型覆盖参数；使用当前模型。
 2. 子 Agent 第一条工具调用执行交接中的精确 `review-claim` 命令。Hook 将已观察
    到的 spawn 与宿主事件中的真实 `agent_id` 绑定。不要从主 Agent 伪造认领或身份。
 3. 子 Agent 使用允许的 `cat`、`rg` 等命令读取固定快照、预生成 `diff.patch`、

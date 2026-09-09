@@ -418,6 +418,74 @@ class IndependentReviewTests(unittest.TestCase):
         output = self.tool("collaborationspawn_agent", value, {}, event="PreToolUse")
         self.assertEqual(output.get("hookSpecificOutput", {}).get("permissionDecision"), "deny", output)
 
+    def encrypted_review_input(self, request, task_name=None):
+        """The host can encrypt the handoff before any hook observes the spawn."""
+        value = self.review_input(request)
+        value["message"] = "gAAAAAB" + "Zm9yd2FyZGVk" * 24
+        if task_name is not None:
+            value["task_name"] = task_name
+        return value
+
+    def test_host_encrypted_handoff_still_binds_the_reviewer(self):
+        self.start()
+        self.edit()
+        self.verify()
+        request, _ = self.prepare()
+        value = self.encrypted_review_input(request)
+        pre = self.tool(
+            "collaborationspawn_agent", value, {}, event="PreToolUse",
+            tool_use_id="spawn-encrypted",
+        )
+        self.assertNotEqual(
+            pre.get("hookSpecificOutput", {}).get("permissionDecision"), "deny", pre
+        )
+        self.tool(
+            "collaborationspawn_agent", value,
+            {"task_name": "/root/" + value["task_name"]}, tool_use_id="spawn-encrypted",
+        )
+        agent_id = "encrypted-handoff-reviewer"
+        self.hook("SubagentStart", agent_id=agent_id, agent_type="default")
+        self.claim(request, agent_id=agent_id)
+        self.finish_review(request, agent_id=agent_id)
+        self.assertEqual(self.stop(), {})
+        self.assertEqual(self.state()["phase"], "completed")
+
+    def test_encrypted_handoff_for_another_run_is_rejected(self):
+        self.start()
+        self.edit()
+        request, _ = self.prepare()
+        value = self.encrypted_review_input(
+            request, task_name="completion_review_0123456789abcdef"
+        )
+        output = self.tool("collaborationspawn_agent", value, {}, event="PreToolUse")
+        self.assertEqual(
+            output.get("hookSpecificOutput", {}).get("permissionDecision"), "deny", output
+        )
+
+    def test_spawn_acknowledgement_survives_a_missing_tool_use_id(self):
+        self.start()
+        self.edit()
+        self.verify()
+        request, _ = self.prepare()
+        value = self.review_input(request)
+        pre = self.tool(
+            "collaborationspawn_agent", value, {}, event="PreToolUse",
+            tool_use_id="spawn-untracked",
+        )
+        self.assertNotEqual(
+            pre.get("hookSpecificOutput", {}).get("permissionDecision"), "deny", pre
+        )
+        self.tool(
+            "collaborationspawn_agent", value,
+            {"task_name": "/root/" + value["task_name"]}, tool_use_id=None,
+        )
+        agent_id = "untracked-spawn-reviewer"
+        self.hook("SubagentStart", agent_id=agent_id, agent_type="default")
+        self.claim(request, agent_id=agent_id)
+        self.finish_review(request, agent_id=agent_id)
+        self.assertEqual(self.stop(), {})
+        self.assertEqual(self.state()["phase"], "completed")
+
     def test_unrelated_agent_creation_is_not_restricted(self):
         self.start()
         output = self.tool(

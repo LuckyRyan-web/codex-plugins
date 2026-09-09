@@ -25,6 +25,7 @@ READ_COMMAND = re.compile(
     r"^\s*(?:(?:cat|rg|grep|head|tail|wc|stat|file|ls|pwd)\b|"
     r"git\s+(?:diff|show|status|ls-files|log|rev-parse)\b)[^;&|<>$\x60]*$")
 REVIEW_PREFIX = "[completion-review:"
+REVIEW_TASK_PREFIX = "completion_review_"
 ENUMERATION_RE = re.compile(
     r"^[ \t]*(?:[-*\u2022\u00b7]|\(?\d{1,2}[.)\u3001]|[\uff08(]\d{1,2}[)\uff09]|"
     r"\u7b2c[\u4e00-\u5341]+[\u3001.)\uff09])[ \t]*\S", re.M)
@@ -192,7 +193,7 @@ def preparation_result(request, audit_file):
         "review_required": request["review_required"],
         "review_run_id": request["review_run_id"],
         "review_request": str(request_path(audit_file)),
-        "spawn": {"task_name": "completion_review_" + request["review_run_id"],
+        "spawn": {"task_name": REVIEW_TASK_PREFIX + request["review_run_id"],
                   "fork_turns": "none", "message": handoff(request, audit_file)}
                  if request["review_required"] else None,
     }
@@ -376,11 +377,25 @@ def before_tool(state, payload):
         return None
     args = payload.get("tool_input") or {}
     message = args.get("message", args.get("prompt", ""))
-    if not isinstance(message, str) or not message.startswith(REVIEW_PREFIX):
+    if not isinstance(message, str):
+        message = ""
+    task_name = args.get("task_name")
+    # The host may encrypt the handoff before any hook observes the call, so the
+    # review spawn is also recognised by the plaintext task name that
+    # prepare-review handed out. That name carries the fresh review run id, so
+    # only a spawn prepared for this code version can present it.
+    named = isinstance(task_name, str) and task_name.startswith(REVIEW_TASK_PREFIX)
+    readable = message.startswith(REVIEW_PREFIX)
+    if not readable and not named:
         return None
     if not current or not current["review_required"]:
         return "先准备当前代码的独立验收材料。"
-    if message != handoff(current, state["audit_path"]):
+    if named and task_name != REVIEW_TASK_PREFIX + current["review_run_id"]:
+        return "请用 prepare-review 为当前代码返回的 task_name 启动独立验收。"
+    # An unreadable handoff cannot be compared here; the reviewer still has to
+    # run the claim command carrying this audit path and run id, which only the
+    # handoff contains, and its report must match both digests.
+    if readable and message != handoff(current, state["audit_path"]):
         return "请原样使用 prepare-review 返回的独立验收提示。"
     if args.get("fork_turns") != "none":
         return "独立验收必须显式设置 fork_turns 为 none。"
@@ -403,12 +418,29 @@ def before_tool(state, payload):
     return None
 
 
+def acknowledges_spawn(current, payload):
+    """Recognise the host result of the review spawn this task started.
+
+    The host does not always echo the tool_use_id seen before the call, so a
+    result naming the prepared review task is accepted as the same spawn.
+    """
+    if not is_agent(payload) or not current.get("spawned") or current.get("spawn_acknowledged"):
+        return False
+    tool_use_id = payload.get("tool_use_id")
+    if tool_use_id and current.get("spawn_tool_use_id") == tool_use_id:
+        return True
+    expected = REVIEW_TASK_PREFIX + current["review_run_id"]
+    return any(isinstance(item.get("task_name"), str)
+               and item["task_name"].rsplit("/", 1)[-1] == expected
+               for item in objects(payload.get("tool_response")))
+
+
 def after_tool(state, payload):
     review = state.get("review")
     if not review:
         return False
     current = current_review(state)
-    if current and is_agent(payload) and current.get("spawn_tool_use_id") == payload.get("tool_use_id"):
+    if current and acknowledges_spawn(current, payload):
         # The observed runtime returns task_name, not an agent UUID.
         names = [o["task_name"] for o in objects(payload.get("tool_response"))
                  if isinstance(o.get("task_name"), str)]
