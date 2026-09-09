@@ -713,6 +713,8 @@ def validate_disposition(marker, state, facts):
 def continuation_reason(state, errors, facts, attempt):
     # The reason is user-facing, so it stays short; the full audit findings
     # reach the model through continuation_context on the next prompt.
+    if review_gate.preparation_limit(state):
+        return "独立验收范围超出快照限制，重试无效；请用 blocked 状态说明原因收尾。"
     if review_gate.blocking_failure(state):
         return "独立验收无法完成，请修复后重试，或用 blocked 状态说明具体原因。"
     return "还有验收项需要处理，请继续完成并核验。"
@@ -1140,6 +1142,8 @@ def main(argv):
             emit(result)
             return 0
         except (OSError, ValueError, KeyError, TypeError, SnapshotError) as exc:
+            if argv[1] == "prepare-review" and len(argv) == 4:
+                review_gate.note_preparation_failure(argv[3], exc)
             sys.stderr.write("Independent review unavailable: %s\n" % exc)
             return 2
     if len(argv) == 4 and argv[1:3] == ["submit", "--audit-file"]:

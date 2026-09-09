@@ -13,7 +13,8 @@ import shlex
 import tempfile
 import time
 
-from review_snapshot import capture_snapshot, check_snapshot, SnapshotError
+from review_snapshot import (capture_snapshot, check_snapshot, SnapshotError,
+                             SnapshotLimitError)
 from verification_output import response_outcome
 
 MAX_REVIEWS = 2
@@ -79,6 +80,28 @@ def request_path(audit_file):
 
 def context_path(audit_file):
     return audit_location(audit_file).with_suffix(".context.json")
+
+
+def failure_path(audit_file):
+    return audit_location(audit_file).with_suffix(".review-failure.json")
+
+
+def note_preparation_failure(audit_file, exc):
+    """Record a capture limit that preparing again cannot clear.
+
+    Only preparation itself writes this, and only for a limit on the scope it
+    computed. A rejected request leaves no record, so an invalid preparation
+    argument can never be presented as an environment that blocks the task.
+    """
+    if not isinstance(exc, SnapshotLimitError):
+        return
+    try:
+        write_json(failure_path(audit_file), {
+            "version": 1, "task_id": audit_location(audit_file).stem,
+            "reason": str(exc), "at_ns": time.time_ns(),
+        })
+    except (OSError, ValueError):
+        pass
 
 
 def enable(state):
@@ -177,6 +200,12 @@ def preparation_result(request, audit_file):
 
 def prepare(audit_file, data, cwd):
     audit_file = audit_location(audit_file)
+    # This attempt replaces the previous verdict, so an older capture limit
+    # cannot outlive the scope that produced it.
+    try:
+        failure_path(audit_file).unlink()
+    except OSError:
+        pass
     requirements = data.get("requirements")
     if (not isinstance(requirements, list) or not 1 <= len(requirements) <= 20
             or any(not isinstance(x, str) or len(x.strip()) < 4 for x in requirements)):
@@ -290,7 +319,7 @@ def register_preparation(state, payload):
         return False
     if not any(obj.get("status") == "success" and obj.get("review_request") ==
                str(request_path(state["audit_path"])) for obj in objects(payload.get("tool_response"))):
-        return False
+        return adopt_preparation_limit(state, payload)
     if response_outcome(payload.get("tool_response")) != "success":
         raise ReviewError("review preparation command did not succeed")
     request = read_json(request_path(state["audit_path"]))
@@ -298,6 +327,7 @@ def register_preparation(state, payload):
         raise ReviewError("review preparation does not match the current task or code")
     if request["created_at_ns"] < state.get("audit_not_before_ns", 0):
         raise ReviewError("review preparation predates the latest user requirements")
+    state["review"].pop("preparation_error", None)  # this scope was captured
     current = current_review(state)
     if current and current["review_run_id"] == request["review_run_id"]:
         return True
@@ -305,6 +335,32 @@ def register_preparation(state, payload):
         raise ReviewError("wait for the current reviewer before preparing another review")
     state["review"]["current"] = request
     return True
+
+
+def adopt_preparation_limit(state, payload):
+    """Carry a recorded capture limit from a failed preparation into the task.
+
+    Preparation runs in its own process and cannot reach the task state, so the
+    limit it recorded is imported here, on the host-observed failure of that
+    same command. Every attempt clears the record first, so an attempt that
+    left none also retires a limit recorded by an earlier scope.
+    """
+    if response_outcome(payload.get("tool_response")) != "failed":
+        return False
+    try:
+        record = read_json(failure_path(state["audit_path"]))
+    except (OSError, ValueError):
+        record = {}
+    reason = record.get("reason")
+    if record.get("task_id") != state["task_id"] or not isinstance(reason, str) or not reason.strip():
+        # Report the retirement so the caller persists it.
+        return state["review"].pop("preparation_error", None) is not None
+    state["review"]["preparation_error"] = reason.strip()
+    raise ReviewError(reason.strip() + "；重试不会改变这个范围，请以 blocked 状态收尾。")
+
+
+def preparation_limit(state):
+    return (state.get("review") or {}).get("preparation_error")
 
 
 def before_tool(state, payload):
@@ -467,6 +523,8 @@ def blocking_failure(state):
     review = state.get("review")
     if not review:
         return None
+    if review.get("preparation_error"):
+        return "independent review scope exceeds a capture limit: " + review["preparation_error"]
     current = current_review(state)
     if current and current.get("review_required") and current.get("spawned"):
         if not current.get("spawn_acknowledged") and current.get("report_error"):
@@ -485,6 +543,9 @@ def completion_errors(state):
         return []  # Active tasks from earlier versions retain their protocol.
     if review.get("context_error"):
         return [review["context_error"]]
+    if review.get("preparation_error"):
+        return ["independent review cannot be prepared (" + review["preparation_error"]
+                + "); report the task as blocked instead of complete"]
     current = current_review(state)
     if not current:
         return ["prepare-review is required before declaring completion"]

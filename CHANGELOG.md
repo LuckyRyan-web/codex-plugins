@@ -20,6 +20,17 @@ All notable changes to this repository are documented here.
   `blocked` 因“没有观察到失败事件”被拒，任务只能反复推回直至降级。
 - 出现上述失败时，Stop 推回改为“独立验收无法完成，请修复后重试，或用
   blocked 状态说明具体原因”，替代无差别的通用提示。
+- `prepare-review` 因快照范围超限（单文件 2 MiB、总量 8 MiB、200 文件、
+  diff 体积）而无法准备时，同样允许 `blocked` 收尾。此前只覆盖“子 Agent 起不
+  来”，准备阶段就失败则 `review.current` 从未建立，`blocking_failure` 认不出
+  来；那条失败的命令又因含 `completion_guard.py` 被归为 guard 事件而不入账，
+  两路证据同时为空，任务只能被通用提示反复推回直到 fail-open。
+- 快照超限与请求本身被拒（要求条数不合法等）分开处理：只有前者由
+  `prepare-review` 自己写下记录并计入阻塞，换参数重跑能解决的错误不放行
+  `blocked`。每次准备先清空该记录，所以之后任何一次没有再触发超限的准备
+  （成功或仅被拒），都会让旧的超限失效。
+- 超限时 PostToolUse 当场告知具体限制，Stop 推回改为“独立验收范围超出快照
+  限制，重试无效；请用 blocked 状态说明原因收尾”，不再让模型去重试。
 
 ### 调整（完成门槛）
 

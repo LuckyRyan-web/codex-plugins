@@ -270,6 +270,19 @@ class ReviewSnapshotTests(unittest.TestCase):
             with self.assertRaisesRegex(SnapshotError, "output exceeded"):
                 capture_snapshot(self.repo)
 
+    def test_scope_limits_are_reported_as_unclearable(self):
+        """A limit on the scope itself cannot be cleared by preparing again."""
+        self.write("large.bin", b"x" * (SNAPSHOT.MAX_FILE_BYTES + 1))
+        with self.assertRaises(SNAPSHOT.SnapshotLimitError):
+            capture_snapshot(self.repo)
+
+    def test_missing_explicit_scope_is_not_an_unclearable_limit(self):
+        plain = self.base / "plain"
+        plain.mkdir()
+        with self.assertRaises(SnapshotError) as caught:
+            capture_snapshot(plain)
+        self.assertNotIsInstance(caught.exception, SNAPSHOT.SnapshotLimitError)
+
     def test_binary_file_is_hashed_without_binary_patch_expansion(self):
         self.write("image.bin", b"\x00before")
         self.git("add", "image.bin")

@@ -47,6 +47,15 @@ class SnapshotError(RuntimeError):
     """The review scope cannot be captured or verified safely and completely."""
 
 
+class SnapshotLimitError(SnapshotError):
+    """The scope itself exceeds a capture limit.
+
+    Preparation arguments cannot shrink it: dirty and untracked files are
+    always in scope, so repeating the capture reaches the same limit. Callers
+    use this to tell an unclearable environment apart from a bad request.
+    """
+
+
 def _git(cwd, args, allow_failure=False, output_limit=None):
     limit = MAX_GIT_OUTPUT_BYTES if output_limit is None else output_limit
     overrides = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"]
@@ -85,7 +94,7 @@ def _git(cwd, args, allow_failure=False, output_limit=None):
                 process.wait()
                 raise SnapshotError("Git command exceeded the 2 second time limit") from exc
             if stdout.tell() > limit or stderr.tell() > MAX_GIT_OUTPUT_BYTES:
-                raise SnapshotError("Git output exceeded the snapshot size limit")
+                raise SnapshotLimitError("Git output exceeded the snapshot size limit")
             stdout.seek(0)
             stderr.seek(0)
             output, error = stdout.read(), stderr.read()
@@ -164,7 +173,7 @@ def _scope(root, is_git, head, explicit):
             untracked.update(set(explicit) - tracked_explicit)
     scope = sorted(set(explicit) | dirty | untracked)
     if len(scope) > MAX_FILES:
-        raise SnapshotError("Snapshot exceeds the 200 file limit")
+        raise SnapshotLimitError("Snapshot exceeds the 200 file limit")
     if not is_git and not scope:
         raise SnapshotError("A non-Git snapshot requires explicit file paths")
     return scope, untracked
@@ -187,7 +196,7 @@ def _read_file(root, relative):
         if not stat.S_ISREG(before.st_mode):
             raise SnapshotError("Snapshot path is not a regular file: " + relative)
         if before.st_size > MAX_FILE_BYTES:
-            raise SnapshotError("Snapshot file exceeds the 2 MiB limit: " + relative)
+            raise SnapshotLimitError("Snapshot file exceeds the 2 MiB limit: " + relative)
         chunks, size = [], 0
         while True:
             chunk = os.read(descriptor, min(65536, MAX_FILE_BYTES + 1 - size))
@@ -196,7 +205,7 @@ def _read_file(root, relative):
             chunks.append(chunk)
             size += len(chunk)
             if size > MAX_FILE_BYTES:
-                raise SnapshotError("Snapshot file exceeds the 2 MiB limit: " + relative)
+                raise SnapshotLimitError("Snapshot file exceeds the 2 MiB limit: " + relative)
         after = os.fstat(descriptor)
         current = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
         identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
@@ -223,7 +232,7 @@ def _read_scope(root, scope):
         if data is not None:
             total += len(data)
             if total > MAX_TOTAL_BYTES:
-                raise SnapshotError("Snapshot content exceeds the 8 MiB total limit")
+                raise SnapshotLimitError("Snapshot content exceeds the 8 MiB total limit")
             contents[path] = data
     return entries, contents
 

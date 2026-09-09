@@ -241,6 +241,25 @@ class IndependentReviewTests(unittest.TestCase):
             tool_use_id=tool_use_id,
         )
 
+    def oversized_artifact(self, name="report.html"):
+        """An untracked workspace file the task never touched, over the file limit."""
+        (self.workspace / name).write_bytes(b"<p>filler</p>\n" * 200000)
+
+    def failed_prepare(self, requirements=None, paths=None, risk="auto"):
+        value = {
+            "requirements": self.requirements if requirements is None else requirements,
+            "paths": ["app.py"] if paths is None else paths,
+            "risk": risk,
+        }
+        args = ["prepare-review", "--audit-file", str(self.audit_path)]
+        result = self.command(args, value)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        output = self.tool(
+            "Bash", {"command": shlex.join([sys.executable, str(SCRIPT), *args])},
+            {"exit_code": 2, "output": result.stderr},
+        )
+        return result, output
+
     def audit_errors(self):
         path = list(self.data.rglob("audits/%s/latest.json" % self.task_id))
         self.assertEqual(len(path), 1, path)
@@ -555,6 +574,62 @@ class IndependentReviewTests(unittest.TestCase):
         self.assert_blocked(self.stop())
         self.assertEqual(self.blocked_stop("两次独立验收均无法取得有效结论。"), {})
         self.assertEqual(self.state()["phase"], "blocked_external")
+
+    def test_uncapturable_review_scope_can_be_declared_an_external_blocker(self):
+        self.start()
+        self.edit()
+        self.verify()
+        self.oversized_artifact()
+        result, output = self.failed_prepare()
+        self.assertIn("2 MiB", result.stderr)
+        self.assertIn("2 MiB", output["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(
+            self.blocked_stop("工作区已有的 HTML 文件超过快照 2 MiB 上限，独立验收无法准备。"), {})
+        self.assertEqual(self.state()["phase"], "blocked_external")
+
+    def test_uncapturable_review_scope_is_not_reported_as_retryable(self):
+        self.start()
+        self.edit()
+        self.verify()
+        self.oversized_artifact()
+        self.failed_prepare()
+        refused = self.stop()
+        self.assert_blocked(refused)
+        self.assertIn("重试无效", refused["reason"])
+        self.assertLess(len(refused["reason"]), 80)
+        self.assertTrue(any("2 MiB" in error for error in self.audit_errors()), self.audit_errors())
+
+    def test_a_rejected_preparation_request_does_not_license_a_blocked_disposition(self):
+        self.start()
+        self.edit()
+        self.verify()
+        result, _ = self.failed_prepare(requirements=["no"])
+        self.assertIn("acceptance requirements", result.stderr)
+        self.assert_blocked(self.blocked_stop("独立验收准备命令失败。"))
+        self.assertNotEqual(self.state()["phase"], "blocked_external")
+
+    def test_a_capturable_scope_clears_an_earlier_recorded_limit(self):
+        self.start()
+        self.edit()
+        self.verify()
+        self.oversized_artifact()
+        self.failed_prepare()
+        (self.workspace / "report.html").unlink()
+        request, _ = self.prepare()
+        self.finish_review(request)
+        self.assertEqual(self.stop(), {})
+        self.assertEqual(self.state()["phase"], "completed")
+
+    def test_a_later_preparation_attempt_drops_a_stale_limit(self):
+        self.start()
+        self.edit()
+        self.verify()
+        self.oversized_artifact()
+        self.failed_prepare()
+        (self.workspace / "report.html").unlink()
+        self.failed_prepare(requirements=["no"])
+        self.assert_blocked(self.blocked_stop("独立验收准备命令失败。"))
+        self.assertNotEqual(self.state()["phase"], "blocked_external")
 
     def test_a_running_reviewer_does_not_license_a_blocked_disposition(self):
         self.start()
